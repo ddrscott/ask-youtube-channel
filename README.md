@@ -24,6 +24,7 @@ The answer is **never un-cited**. Every claim in the synthesized response maps t
 3. **Deployable per channel.** One codebase, many deployments. A single channel's index lives in its own D1/Vectorize namespace with its own subdomain. No multi-tenant query surface — the scope of what the app knows is always exactly one channel's output.
 4. **Ingest is batch, query is instant.** Scraping, transcription, and indexing happen on background queues. End-user queries hit a pre-built vector index and return in under a second.
 5. **Q&A-shaped indexing beats generic chunking.** The indexer's job isn't to split transcripts into 500-token chunks — it's to find moments where a **question is posed or implied and an answer is given**, and tag those moments with the question they answer. That's the unit of retrieval.
+6. **The chunker sees the whole transcript in one LLM call.** No sliding windows, no map-reduce stitching. A 256k-context model comfortably fits any realistic video transcript (a 10-hour livestream transcribes to ~120k tokens), and single-pass chunking eliminates the dominant failure mode of windowed approaches — Q&A moments split across window boundaries. Full-transcript context also lets the model resolve pronouns, callbacks, and multi-turn exchanges that local chunking can't see.
 
 ## What It Does (Vision)
 
@@ -31,12 +32,15 @@ The answer is **never un-cited**. Every claim in the synthesized response maps t
 
 1. **Channel enumeration** — given a channel handle, list every video (YouTube Data API, or `yt-dlp` for channels without API quota).
 2. **Transcript capture** — pull official captions when available; fall back to `yt-dlp --write-auto-subs` or Whisper for videos with no captions. Store word-level timestamps.
-3. **Q&A chunking** — an LLM pass sweeps each transcript and extracts **answered-question moments**: spans where a question is asked (by host, guest, audience, or rhetorically) and answered. Each chunk gets:
+3. **Q&A chunking** — a **single LLM call per video** with the **entire transcript** in context (256k-context model, structured output). The model extracts **answered-question moments**: spans where a question is asked (by host, guest, audience, or rhetorically) and answered. One pass, full document context, no windowing. Each chunk gets:
    - The inferred question (normalized, canonicalized)
-   - The answer text
-   - Video ID + start/end timestamps
+   - The answer text (verbatim or near-verbatim span from the transcript)
+   - Video ID + `start_seconds` / `end_seconds` (derived from the word-level timestamps in the input)
    - Speaker attribution (best effort)
    - Topic tags
+   - Confidence score
+
+   The prompt hands the model the transcript as `[start_seconds] speaker?: text` lines so timestamps flow through structured output without hallucination. If a transcript ever exceeds the context window (extremely long livestream), fall back to a deterministic section split on long silence gaps and run the chunker once per section — never chunk mid-conversation.
 4. **Embedding + indexing** — chunks embedded and upserted into Cloudflare Vectorize. Raw transcripts stored in R2, structured metadata in D1.
 5. **Re-index on new uploads** — a scheduled worker checks for new videos on each channel daily and incrementally ingests them.
 
@@ -67,7 +71,8 @@ Mirrors [`~/code/justright.fm`](../justright.fm/) — full Cloudflare stack.
 | Object Store | Cloudflare R2 | Raw transcripts, thumbnails (cached), optional audio for Whisper fallback |
 | Queues | Cloudflare Queues | Ingest pipeline: enumerate → transcribe → chunk → embed |
 | Durable Objects | CF DOs | Per-channel ingest coordinator with SQLite state |
-| LLM (synth) | Groq / Workers AI / Anthropic | Answer synthesis with citations |
+| LLM (chunker) | Long-context model (≥256k ctx) with structured output — e.g. Claude Sonnet, Gemini 2.x, GPT-4.1 | Single-pass Q&A extraction over full transcript |
+| LLM (synth) | Fast cheap model — Groq Llama / Haiku / Workers AI | Answer synthesis with citations (short output, small input — cheap model fine) |
 | Embeddings | Workers AI (bge-small) or OpenAI | Per-chunk vectors |
 | Transcription fallback | Whisper via fal.ai or OpenAI | Only when YouTube captions are missing |
 | YouTube data | YouTube Data API v3 + `yt-dlp` fallback | Caption fetch + metadata |
@@ -217,7 +222,7 @@ CREATE TABLE ingest_runs (
 ## Open Questions
 
 - **Transcription cost control.** Whisper fallback costs real money per hour of video. Cap per-channel ingest budgets and prioritize videos with existing captions.
-- **Chunk quality vs. cost.** The Q&A chunker is the whole ballgame. Test Groq Llama vs. GPT-4o-mini vs. Sonnet on a 10-video sample before committing. The cheapest model that produces acceptable chunks wins.
+- **Chunker model choice.** The Q&A chunker is the whole ballgame, and it must be a ≥256k-context model with reliable structured output. Bake off on a 10-video sample: Claude Sonnet vs. Gemini 2.x vs. GPT-4.1. Score on (a) did it find every real Q&A moment, (b) did it invent any, (c) are the timestamps accurate. The cheapest model that passes wins. Note: a single one-hour transcript ≈ 12k tokens in, maybe 4–8k tokens out — this is not the expensive path, even on the priciest model.
 - **Licensing.** Deep-linking to YouTube is clearly fair use. Showing transcript excerpts in the answer synthesis is where we need to be careful — keep excerpts short, always link to source, and add a creator opt-out path if a channel owner asks.
 - **Speaker attribution.** Multi-speaker channels (podcasts, debates) make attribution messy. v0 can skip it; v1 should take a swing using metadata + heuristics.
 - **"Confidence" threshold.** If the best retrieved chunk is below some similarity threshold, return "no match" instead of a synthesized hallucination. Calibrate this threshold on real queries, not intuition.
