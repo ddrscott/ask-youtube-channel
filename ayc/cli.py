@@ -32,6 +32,7 @@ from .queue import (
 )
 from .search import retrieve, synthesize_answer
 from .transcripts import load_transcript, transcribe_video
+from .verify import quarantine_invalid, verify_completed_dir
 
 app = typer.Typer(
     name="ayc",
@@ -377,14 +378,84 @@ def queue_prepare(
 
 @queue_app.command("merge")
 def queue_merge() -> None:
-    """Read every queue/completed/*.chunks.json into the DB and archive the file."""
+    """Verify every queue/completed/*.chunks.json against its source transcript,
+    quarantine any with errors to queue/failed/, then insert the rest into the DB.
+    """
     cfg = _cfg()
     conn = connect(cfg.db_path)
-    videos, chunks, errors = merge_completed(conn)
+    videos, chunks, errors, quarantined = merge_completed(conn, cfg.transcripts_dir)
     console.print(
         f"[green]Merged:[/green] {videos} video(s), {chunks} chunk(s)  "
-        f"[yellow]Errors:[/yellow] {errors}"
+        f"[yellow]Errors:[/yellow] {errors}  "
+        f"[red]Quarantined:[/red] {quarantined}"
     )
+    if quarantined:
+        console.print(
+            f"[dim]→ See {FAILED_DIR}/*.verify-error.txt for details on the quarantined files.[/dim]"
+        )
+
+
+@queue_app.command("verify")
+def queue_verify(
+    quarantine: bool = typer.Option(
+        False,
+        "--quarantine",
+        help="Move files with errors to queue/failed/ (otherwise just report).",
+    ),
+) -> None:
+    """Verify every queue/completed/*.chunks.json against its source transcript.
+
+    Checks: timestamps within transcript range, schema validity, non-empty Q/A.
+    By default, only reports — pass --quarantine to move bad files to queue/failed/.
+    """
+    cfg = _cfg()
+    verifications = verify_completed_dir(COMPLETED_DIR, cfg.transcripts_dir)
+
+    total_files = len(verifications)
+    valid = sum(1 for v in verifications if v.is_valid)
+    invalid = total_files - valid
+    total_warnings = sum(len(v.warnings) for v in verifications)
+    total_chunks = sum(v.chunk_count for v in verifications)
+
+    if total_files == 0:
+        console.print("[yellow]No files in queue/completed/ to verify.[/yellow]")
+        return
+
+    table = Table(title="Verification results")
+    table.add_column("Video")
+    table.add_column("Chunks", justify="right")
+    table.add_column("Errors", justify="right")
+    table.add_column("Warnings", justify="right")
+    table.add_column("Sample issue", overflow="fold")
+    for v in verifications:
+        first = v.errors[0] if v.errors else (v.warnings[0] if v.warnings else None)
+        sample = ""
+        if first is not None:
+            loc = (
+                f"chunk[{first.chunk_index}].{first.field}"
+                if first.chunk_index >= 0
+                else f"<file>.{first.field}"
+            )
+            sample = f"[{first.severity}] {loc}: {first.message}"
+        table.add_row(v.video_id, str(v.chunk_count), str(len(v.errors)), str(len(v.warnings)), sample)
+    console.print(table)
+    console.print(
+        f"\n[bold]{total_files}[/bold] file(s), [bold]{total_chunks}[/bold] chunk(s)  "
+        f"[green]Valid:[/green] {valid}  [red]Invalid:[/red] {invalid}  "
+        f"[yellow]Warnings:[/yellow] {total_warnings}"
+    )
+
+    if quarantine and invalid:
+        moved = quarantine_invalid(verifications, FAILED_DIR)
+        console.print(
+            f"\n[red]Quarantined[/red] {moved} file(s) to {FAILED_DIR}. "
+            f"See *.verify-error.txt for details."
+        )
+    elif invalid:
+        console.print(
+            f"\n[dim]Pass --quarantine to move the {invalid} invalid file(s) "
+            f"to queue/failed/. (Otherwise `ayc queue merge` will quarantine them automatically.)[/dim]"
+        )
 
 
 @queue_app.command("status")

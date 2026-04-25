@@ -1,6 +1,6 @@
 ---
 description: End-to-end Ask-YouTube-Channel pipeline. Resumes idempotently from current state. Dispatches the ayc-chunker agent in parallel for chunking; uses the Python CLI for everything else.
-argument-hint: "[--form long|short|all] [--limit N] [--phase all|status|transcribe|prepare|chunk|merge|embed] [--parallel K]"
+argument-hint: "[--form long|short|all] [--limit N] [--phase all|status|transcribe|prepare|chunk|verify|merge|embed] [--parallel K]"
 ---
 
 You are running the **Ask-YouTube-Channel (AYC) runbook**. This command is the single source of truth for ingesting and processing a YouTube channel into a queryable clip index.
@@ -20,7 +20,8 @@ status      → show current state of DB and queue
 transcribe  → uv run ayc transcripts (yt-dlp pulls captions, writes data/transcripts/)
 prepare     → uv run ayc queue prepare (writes queue/pending/<id>.json per video)
 chunk       → dispatch ayc-chunker agent per pending file (parallel, batched)
-merge       → uv run ayc queue merge (inserts chunks into SQLite, archives queue file)
+verify      → uv run ayc queue verify (timestamp + schema check; quarantines bad files)
+merge       → uv run ayc queue merge (re-verifies, then inserts chunks into SQLite)
 embed       → uv run ayc embed (OpenAI text-embedding-3-small, batched)
 all         → run every phase in order (default)
 ```
@@ -81,11 +82,25 @@ This is the heart of the runbook.
 
 5. **`--parallel` ceiling: 3**. Even if the user passes a higher number, cap it at 3 — Claude Code usage limits make 4+ parallel agents risky for a long batch. Note this clamp to the user.
 
+## Phase: verify
+
+Run: `uv run ayc queue verify --quarantine`. Checks every `queue/completed/*.chunks.json`:
+
+- Timestamps must be within the source transcript's range (±5s tolerance).
+- Each `start_seconds` and `end_seconds` should be near a real segment boundary (warning if not).
+- Schema: `kind ∈ {qa, objection}`, `confidence ∈ [0, 1]`, non-empty Q/A text, etc.
+
+Files with errors are moved to `queue/failed/` along with a `.verify-error.txt` explaining what's wrong. The chunker has full-transcript context per video, so a localized error is suspicious about the rest of the file too — the entire file is quarantined rather than splitting it.
+
+If anything was quarantined, surface that to the user. They can inspect the `.verify-error.txt` and either re-run the chunker on that video specifically (`uv run ayc queue prepare --form long --limit 1` then dispatch one agent) or accept the loss.
+
+(`ayc queue merge` runs verify automatically as defense in depth, so you can skip this phase if you want — but running it explicitly first lets you see the full report before anything moves.)
+
 ## Phase: merge
 
-Run: `uv run ayc queue merge`. Inserts chunks into SQLite, deletes pending files, moves completed files to `queue/archive/`. Reports videos merged + total chunks + errors.
+Run: `uv run ayc queue merge`. Verifies + quarantines first, then inserts the rest into SQLite, deletes pending files, moves completed files to `queue/archive/`. Reports videos merged + total chunks + merge errors + quarantined.
 
-If errors > 0, point the user at `queue/failed/` for the malformed files.
+If errors > 0 or quarantined > 0, point the user at `queue/failed/` for the affected files.
 
 ## Phase: embed
 

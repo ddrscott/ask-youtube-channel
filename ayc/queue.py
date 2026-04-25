@@ -23,6 +23,7 @@ from pathlib import Path
 from .config import REPO_ROOT
 from .db import insert_chunk, mark_video
 from .transcripts import load_transcript
+from .verify import quarantine_invalid, verify_completed_dir
 
 
 QUEUE_DIR = REPO_ROOT / "queue"
@@ -126,18 +127,29 @@ def prepare_pending(
     return written, skipped
 
 
-def merge_completed(conn: sqlite3.Connection) -> tuple[int, int, int]:
+def merge_completed(
+    conn: sqlite3.Connection, transcripts_dir: Path
+) -> tuple[int, int, int, int]:
     """Read every queue/completed/*.chunks.json and insert chunks into the DB.
 
-    On success, the completed file is moved to queue/archive/ and the matching
-    queue/pending/<id>.json is deleted.
+    Verifies each file against its source transcript first. Files with errors
+    are quarantined to queue/failed/ before merging starts.
 
-    Returns (videos_merged, total_chunks_inserted, errors).
+    On successful merge, the completed file is moved to queue/archive/ and the
+    matching queue/pending/<id>.json is deleted.
+
+    Returns (videos_merged, total_chunks_inserted, merge_errors, quarantined).
     """
     ensure_dirs()
+
+    # Defense-in-depth: verify every file before merging. Anything broken
+    # gets quarantined to queue/failed/ with a .verify-error.txt sibling.
+    verifications = verify_completed_dir(COMPLETED_DIR, transcripts_dir)
+    quarantined = quarantine_invalid(verifications, FAILED_DIR)
+
     files = sorted(COMPLETED_DIR.glob("*.chunks.json"))
     if not files:
-        return 0, 0, 0
+        return 0, 0, 0, quarantined
 
     videos = 0
     chunks = 0
@@ -179,4 +191,4 @@ def merge_completed(conn: sqlite3.Connection) -> tuple[int, int, int]:
             errors += 1
             error_path = FAILED_DIR / f"{path.stem}.merge-error.txt"
             error_path.write_text(f"merge error: {e}\n\nfile: {path}\n", encoding="utf-8")
-    return videos, chunks, errors
+    return videos, chunks, errors, quarantined

@@ -16,8 +16,11 @@ scratch.*
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.pyright/
 data/
 ayc.db
 ayc.db-*
@@ -25,3 +28,9 @@ queue/pending/
 queue/completed/
 queue/failed/
 queue/archive/
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
