@@ -4,7 +4,152 @@ Ask a question, get an answer backed by cited clips from a YouTube channel's bac
 
 A deployable-per-channel search and Q&A app. Point it at any channel, let it ingest every public video, and you get a site where users can ask freeform questions and receive short, synthesized answers alongside the exact timestamped clips that support the claim.
 
-**First deployment target:** Abolitionist Rising (ask @Grassley for channel list).
+**First deployment target:** Abolitionists Rising (`UCopqtPoYi92ZMdXEGWXaPTA`, https://www.youtube.com/@AbolitionistsRising).
+
+## Status
+
+- **Vision (this README, below):** Deployable-per-channel Cloudflare app with subdomain per channel.
+- **What exists today:** Local CLI prototype (Python + uv + sqlite). Validates the chunker quality, the query-reformulation pattern, and the end-to-end retrieval flow before we commit to the full CF stack. See [Local CLI Prototype](#local-cli-prototype).
+
+## Local CLI Prototype
+
+A `uv`-managed Python package (`ayc/`) that ingests a channel into a local sqlite DB and answers queries against it.
+
+### What it does differently from the vision
+
+- **Two chunk kinds** in a single pass per video: `qa` (answered questions) and `objection` (objections/claims with rebuttals). Abolitionist content is overwhelmingly objection-handling, so the original "answered questions" spec was missing the dominant pattern.
+- **Long-form vs. shorts classification.** `init` enumerates `/videos`, `/streams`, and `/shorts` separately and tags each row's `form`. Editors looking for clips to remix into long-form videos default to `--form long` on `ask`; `--form short` is one-flag away when the editor wants Shorts; `--form all` searches both.
+- **Two chunker paths**:
+  - `ayc chunk` — calls the Anthropic API. Self-contained, scriptable, billed per token. Use for unattended batch ingest, automated tests, or when you don't have a Claude Code session open.
+  - **Claude Code agent** (`ayc-chunker`) — runs against your Claude Code subscription rather than the API. Use for the bulk of the catalog. Workflow is `ayc queue prepare` → dispatch the agent → `ayc queue merge`.
+- **Query-time reformulation.** An LLM expands the raw user input ("but a fetus isn't human") into 2–4 search variants tagged as `qa`, `objection`, or `either`. Each variant gets embedded and scored separately; the union is deduped and ranked. Lets editors type natural inputs that won't directly match index entries.
+- **Storage.** One `data/ayc.db` sqlite file. Embeddings are float32 BLOBs; cosine similarity is brute-force numpy at query time. Fine for any single-channel scale (≤100k chunks).
+- **Models.** Claude Opus 4.7 (1M context, adaptive thinking, structured outputs via `output_config.format`) for chunking, reformulating, synthesizing; OpenAI `text-embedding-3-small` for embeddings.
+
+### Quick start
+
+```sh
+# 1. Install deps
+uv sync
+
+# 2. Set keys (or use .env)
+export ANTHROPIC_API_KEY=...
+export OPENAI_API_KEY=...
+
+# 3. Enumerate every video on the channel (long-form, streams, shorts)
+uv run ayc init "https://www.youtube.com/@AbolitionistsRising"
+
+# 4. Pull transcripts. --form is optional: 'all' (default), 'long', or 'short'.
+uv run ayc transcripts --form long
+
+# 5a. Chunk via the Claude Code agent (preferred for bulk ingest):
+uv run ayc queue prepare --form long
+# → in your Claude Code session:
+#    /ayc-process-queue
+# → after the agent batches finish:
+uv run ayc queue merge
+
+# 5b. Or chunk via the Anthropic API (unattended / automated):
+uv run ayc chunk --form long
+
+# 6. Embed every chunk
+uv run ayc embed
+
+# 7. Ask. Defaults to --form long (editor's reflex). Use --form short or --form all to widen.
+uv run ayc ask "but a fetus isn't human"
+uv run ayc ask "what about cases of rape" --form all
+```
+
+### Long-form vs. shorts
+
+`init` runs three yt-dlp passes against the channel and tags each row's `form`:
+
+| URL | Tagged as | Editor's typical use |
+|-----|-----------|----------------------|
+| `<channel>/videos` | `long` | Primary — clips to remix into a long-form edit |
+| `<channel>/streams` | `long` | Long debates / livestreams |
+| `<channel>/shorts` | `short` | Sometimes the cleanest 30-second street-debate exchanges |
+
+Defaults:
+
+| Command | `--form` default | Reasoning |
+|---------|-----|-----------|
+| `transcripts` | `all` | Slow batch step — ingest both so the editor doesn't wait when they change their mind. |
+| `chunk` | `all` | Same. |
+| `queue prepare` | `all` | Same. |
+| `ask` | `long` | Editors are usually looking for clips to remix into long-form videos. |
+
+### Claude Code agent flow (preferred for bulk chunking)
+
+The chunker is the recurring expensive operation — re-run anytime the prompt iterates. Keeping it on the Anthropic API means every prompt change costs real tokens against the catalog. Moving it to a Claude Code subagent shifts that cost to your Claude Code subscription.
+
+Architecture:
+
+```
+Python (deterministic state)            Claude Code (LLM work)
+─────────────────────────────           ────────────────────────────
+ayc transcripts                  ─►     [ no LLM needed ]
+ayc queue prepare                ─►     queue/pending/<id>.json
+                                            │
+                                            ▼
+                                        Agent: ayc-chunker
+                                        (reads pending/, writes completed/)
+                                            │
+                                            ▼
+ayc queue merge                  ◄─     queue/completed/<id>.chunks.json
+ayc embed                        ─►     [ OpenAI embeddings ]
+ayc ask                          ─►     [ Anthropic API for reformulation+synthesis ]
+```
+
+The chunker agent is defined at `.claude/agents/ayc-chunker.md`. Project-level agents are loaded at Claude Code session start, so a fresh session is needed after pulling the agent file the first time.
+
+Dispatching:
+
+- **Manual one-off:** in Claude Code, ask "process queue/pending/<id>.json with the ayc-chunker agent" — Claude dispatches it.
+- **Batch:** `/ayc-process-queue` (slash command at `.claude/commands/ayc-process-queue.md`) loops over `queue/pending/*.json`, dispatches the agent in parallel batches of 5, and runs `ayc queue merge` at the end.
+
+The agent reads ONE pending transcript per invocation, extracts chunks, writes `queue/completed/<id>.chunks.json`. Failures land in `queue/failed/<id>.error.txt`. The Python merge step archives completed files into `queue/archive/` once their chunks are in the DB.
+
+### Layout
+
+```
+ask-youtube-channel/
+├── pyproject.toml
+├── ayc/                        # Python — deterministic state
+│   ├── cli.py                  # Typer entry — exposes `ayc` and `ayc queue ...`
+│   ├── config.py
+│   ├── db.py                   # sqlite schema + migrations
+│   ├── enumerate.py            # /videos + /streams + /shorts passes
+│   ├── transcripts.py          # yt-dlp auto-subs JSON3 → deduped segments
+│   ├── chunker.py              # API-based chunker (anthropic SDK)
+│   ├── queue.py                # filesystem queue for the agent flow
+│   ├── embed.py                # OpenAI embeddings (batched)
+│   ├── search.py               # reformulate → embed → cosine → synthesize
+│   └── prompts.py              # all LLM system prompts
+├── .claude/
+│   ├── agents/
+│   │   └── ayc-chunker.md      # the chunker agent definition
+│   └── commands/
+│       └── ayc-process-queue.md
+├── queue/                      # gitignored
+│   ├── pending/                # transcripts ready to chunk
+│   ├── completed/              # chunks written by the agent (pre-merge)
+│   ├── failed/                 # agent failures
+│   └── archive/                # post-merge archive of completed files
+├── scripts/
+│   └── ingest_targeted.py      # ingest specific video IDs end-to-end (API path)
+└── data/                       # gitignored: ayc.db + transcripts/
+```
+
+### Other commands
+
+- `uv run ayc status` — counts of videos by `form × ingest_status`, chunk counts by kind.
+- `uv run ayc queue status` — count of pending, completed, failed queue files.
+- `uv run ayc ask "<query>" --json` — machine-readable output (clips + reformulations + synthesized answer).
+- `uv run ayc ask "<query>" --no-synthesis` — clips only, skip the synthesized answer.
+- `uv run python scripts/ingest_targeted.py <video_id> [<video_id> ...]` — ingest specific videos by ID end-to-end via the API path. Useful for iterating on the chunker prompt against a curated set.
+
+## Vision (full architecture)
 
 ## Why
 

@@ -10,3 +10,18 @@ public/dist/
 .DS_Store
 scratch.*
 !scratch.md
+
+# Python prototype
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+data/
+ayc.db
+ayc.db-*
+queue/pending/
+queue/completed/
+queue/failed/
+queue/archive/
