@@ -26,38 +26,65 @@ A `uv`-managed Python package (`ayc/`) that ingests a channel into a local sqlit
 - **Storage.** One `data/ayc.db` sqlite file. Embeddings are float32 BLOBs; cosine similarity is brute-force numpy at query time. Fine for any single-channel scale (≤100k chunks).
 - **Models.** Claude Opus 4.7 (1M context, adaptive thinking, structured outputs via `output_config.format`) for chunking, reformulating, synthesizing; OpenAI `text-embedding-3-small` for embeddings.
 
-### Quick start
+### Quick start (first run)
 
 ```sh
 # 1. Install deps
 uv sync
 
-# 2. Set keys (or use .env)
+# 2. Set keys (or put them in .env)
 export ANTHROPIC_API_KEY=...
 export OPENAI_API_KEY=...
 
 # 3. Enumerate every video on the channel (long-form, streams, shorts)
 uv run ayc init "https://www.youtube.com/@AbolitionistsRising"
+```
 
-# 4. Pull transcripts. --form is optional: 'all' (default), 'long', or 'short'.
-uv run ayc transcripts --form long
+That seeds the catalog. Everything after that is the **`/ayc-runbook` slash command** — see below.
 
-# 5a. Chunk via the Claude Code agent (preferred for bulk ingest):
-uv run ayc queue prepare --form long
-# → in your Claude Code session:
-#    /ayc-process-queue
-# → after the agent batches finish:
-uv run ayc queue merge
+### Recommended workflow: `/ayc-runbook` in Claude Code
 
-# 5b. Or chunk via the Anthropic API (unattended / automated):
-uv run ayc chunk --form long
+The full ingest pipeline lives in a single project command at `.claude/commands/ayc-runbook.md`. It resumes idempotently from current state and dispatches `ayc-chunker` agents in parallel.
 
-# 6. Embed every chunk
-uv run ayc embed
+```
+/ayc-runbook                                  # process up to 10 long-form videos through every phase
+/ayc-runbook --form long --limit 25           # bigger batch
+/ayc-runbook --phase chunk                    # only dispatch agents on whatever's in queue/pending/
+/ayc-runbook --phase status                   # quick look at where things stand
+/ayc-runbook --form short --limit 50          # work on shorts
+```
 
-# 7. Ask. Defaults to --form long (editor's reflex). Use --form short or --form all to widen.
+Defaults: `--form long  --limit 10  --parallel 3  --phase all`. The `--parallel` cap is hard-clamped to **3** to stay clear of Claude Code usage limits during long runs.
+
+### Restart-friendly note
+
+Project agents (`.claude/agents/*.md`) are loaded **at Claude Code session start**. After cloning this repo (or after pulling a new agent file), close and re-open Claude Code so `subagent_type="ayc-chunker"` becomes available. Then run `/ayc-runbook`.
+
+If `/ayc-runbook` reports the agent isn't loaded, that's the symptom — restart Claude Code and re-run the command.
+
+### Querying
+
+After a run, ask the channel a question:
+
+```sh
+# Defaults to --form long (editor's reflex). Use --form short or --form all to widen.
 uv run ayc ask "but a fetus isn't human"
 uv run ayc ask "what about cases of rape" --form all
+uv run ayc ask "Did the Dobbs decision actually abolish abortion?" --json
+```
+
+### CLI fallback (no Claude Code session)
+
+If you can't be in a Claude Code session — e.g. running from CI, a cron job, or a remote shell — use the API-based chunker. It costs Anthropic API tokens instead of Claude Code subscription quota.
+
+```sh
+uv run ayc transcripts --form long
+uv run ayc chunk --form long          # API-based chunker — billed per token
+uv run ayc embed
+uv run ayc ask "..."
+
+# Or in one shot:
+uv run ayc ingest --limit 20
 ```
 
 ### Long-form vs. shorts
@@ -79,11 +106,9 @@ Defaults:
 | `queue prepare` | `all` | Same. |
 | `ask` | `long` | Editors are usually looking for clips to remix into long-form videos. |
 
-### Claude Code agent flow (preferred for bulk chunking)
+### Architecture: Python orchestrates, Claude Code chunks
 
 The chunker is the recurring expensive operation — re-run anytime the prompt iterates. Keeping it on the Anthropic API means every prompt change costs real tokens against the catalog. Moving it to a Claude Code subagent shifts that cost to your Claude Code subscription.
-
-Architecture:
 
 ```
 Python (deterministic state)            Claude Code (LLM work)
@@ -92,7 +117,7 @@ ayc transcripts                  ─►     [ no LLM needed ]
 ayc queue prepare                ─►     queue/pending/<id>.json
                                             │
                                             ▼
-                                        Agent: ayc-chunker
+                                        Agent: ayc-chunker  (×3 in parallel)
                                         (reads pending/, writes completed/)
                                             │
                                             ▼
@@ -101,14 +126,7 @@ ayc embed                        ─►     [ OpenAI embeddings ]
 ayc ask                          ─►     [ Anthropic API for reformulation+synthesis ]
 ```
 
-The chunker agent is defined at `.claude/agents/ayc-chunker.md`. Project-level agents are loaded at Claude Code session start, so a fresh session is needed after pulling the agent file the first time.
-
-Dispatching:
-
-- **Manual one-off:** in Claude Code, ask "process queue/pending/<id>.json with the ayc-chunker agent" — Claude dispatches it.
-- **Batch:** `/ayc-process-queue` (slash command at `.claude/commands/ayc-process-queue.md`) loops over `queue/pending/*.json`, dispatches the agent in parallel batches of 5, and runs `ayc queue merge` at the end.
-
-The agent reads ONE pending transcript per invocation, extracts chunks, writes `queue/completed/<id>.chunks.json`. Failures land in `queue/failed/<id>.error.txt`. The Python merge step archives completed files into `queue/archive/` once their chunks are in the DB.
+The orchestrator is `/ayc-runbook` (`.claude/commands/ayc-runbook.md`). It checks current state, runs whichever pipeline phases need to run, and dispatches `ayc-chunker` agents in parallel batches of 3 (the hard ceiling — keeps you clear of Claude Code usage limits on long runs). Each agent reads ONE pending transcript per invocation, extracts chunks, writes `queue/completed/<id>.chunks.json`. Failures land in `queue/failed/<id>.error.txt`. The Python merge step archives completed files into `queue/archive/` once their chunks are in the DB.
 
 ### Layout
 
@@ -130,7 +148,7 @@ ask-youtube-channel/
 │   ├── agents/
 │   │   └── ayc-chunker.md      # the chunker agent definition
 │   └── commands/
-│       └── ayc-process-queue.md
+│       └── ayc-runbook.md      # /ayc-runbook — full pipeline orchestrator
 ├── queue/                      # gitignored
 │   ├── pending/                # transcripts ready to chunk
 │   ├── completed/              # chunks written by the agent (pre-merge)
