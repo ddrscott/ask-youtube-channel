@@ -11,7 +11,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 
-from .db import upsert_channel, upsert_video
+from .db import ApiClient
 
 
 @dataclass
@@ -119,64 +119,43 @@ def list_videos(channel_url: str) -> list[VideoStub]:
     return videos
 
 
-def enumerate_channel(conn, channel_url: str) -> tuple[ChannelInfo, dict[str, int]]:
-    """Resolve channel and enumerate /videos + /shorts (and /streams as long-form).
+def enumerate_channel(client: ApiClient, channel_url: str) -> tuple[ChannelInfo, dict[str, int]]:
+    """Resolve channel and enumerate /videos + /streams + /shorts.
 
-    Returns the channel info and a dict of per-form counts.
+    Pushes the channel and every video to the cloud API. Returns the channel
+    info and per-form counts.
     """
     info = resolve_channel(channel_url)
-    upsert_channel(conn, info.channel_id, info.handle, info.display_name)
+    client.upsert_channel(info.channel_id, info.handle, info.display_name)
 
     base = _normalize_channel_url(channel_url)
-    counts = {"long": 0, "short": 0, "long_streams": 0, "new": 0}
+    counts = {"long": 0, "short": 0, "long_streams": 0}
 
-    # Long-form videos
+    def _to_payload(v: VideoStub, form: str) -> dict[str, object]:
+        return {
+            "id": v.id,
+            "channel_id": info.channel_id,
+            "title": v.title,
+            "duration_seconds": v.duration_seconds,
+            "thumbnail_url": v.thumbnail_url,
+            "published_at": None,
+            "form": form,
+            "ingest_status": "pending",
+        }
+
     long_videos = list_videos(f"{base}/videos")
     counts["long"] = len(long_videos)
-    for v in long_videos:
-        if upsert_video(
-            conn,
-            video_id=v.id,
-            channel_id=info.channel_id,
-            title=v.title,
-            duration_seconds=v.duration_seconds,
-            thumbnail_url=v.thumbnail_url,
-            published_at=None,
-            form="long",
-        ):
-            counts["new"] += 1
+    if long_videos:
+        client.upsert_videos_bulk([_to_payload(v, "long") for v in long_videos])
 
-    # Live streams (also long-form by nature)
     streams = list_videos(f"{base}/streams")
     counts["long_streams"] = len(streams)
-    for v in streams:
-        if upsert_video(
-            conn,
-            video_id=v.id,
-            channel_id=info.channel_id,
-            title=v.title,
-            duration_seconds=v.duration_seconds,
-            thumbnail_url=v.thumbnail_url,
-            published_at=None,
-            form="long",
-        ):
-            counts["new"] += 1
+    if streams:
+        client.upsert_videos_bulk([_to_payload(v, "long") for v in streams])
 
-    # Shorts
     shorts = list_videos(f"{base}/shorts")
     counts["short"] = len(shorts)
-    for v in shorts:
-        if upsert_video(
-            conn,
-            video_id=v.id,
-            channel_id=info.channel_id,
-            title=v.title,
-            duration_seconds=v.duration_seconds,
-            thumbnail_url=v.thumbnail_url,
-            published_at=None,
-            form="short",
-        ):
-            counts["new"] += 1
+    if shorts:
+        client.upsert_videos_bulk([_to_payload(v, "short") for v in shorts])
 
-    conn.commit()
     return info, counts

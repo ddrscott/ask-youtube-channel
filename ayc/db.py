@@ -1,99 +1,30 @@
-"""SQLite schema and connection helpers."""
+"""HTTP client for the AYC cloud API at ayc.ljs.app.
 
+Replaces the previous local-SQLite backend. Every function that used to
+operate on a `sqlite3.Connection` now goes through `ApiClient`, which speaks
+to the Worker's `/internal/*` endpoints with a service-token bearer auth.
+
+Configuration comes from `Config.api_base_url` and `Config.api_token`
+(see `ayc/config.py`).
+
+The `encode_embedding` / `decode_embedding` helpers are retained because the
+embed phase still produces float32 arrays locally before posting them.
+"""
 from __future__ import annotations
 
 import json
-import sqlite3
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Iterator
+import time
+from typing import Any, Iterator
 
+import httpx
 import numpy as np
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS channels (
-    id TEXT PRIMARY KEY,
-    handle TEXT NOT NULL,
-    display_name TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS videos (
-    id TEXT PRIMARY KEY,
-    channel_id TEXT NOT NULL REFERENCES channels(id),
-    title TEXT NOT NULL,
-    duration_seconds INTEGER,
-    thumbnail_url TEXT,
-    published_at TEXT,
-    form TEXT NOT NULL DEFAULT 'unknown',  -- 'long' | 'short' | 'unknown'
-    transcript_source TEXT,           -- 'auto' | 'manual' | 'whisper'
-    transcript_path TEXT,             -- path to JSON file under data/transcripts/
-    ingest_status TEXT NOT NULL,      -- 'pending' | 'transcribed' | 'chunked' | 'embedded' | 'failed' | 'skipped_no_captions'
-    error TEXT,
-    enumerated_at TEXT DEFAULT (datetime('now')),
-    transcribed_at TEXT,
-    chunked_at TEXT,
-    embedded_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(ingest_status);
-CREATE INDEX IF NOT EXISTS idx_videos_form ON videos(form);
-
-CREATE TABLE IF NOT EXISTS chunks (
-    id TEXT PRIMARY KEY,
-    video_id TEXT NOT NULL REFERENCES videos(id),
-    kind TEXT NOT NULL,               -- 'qa' | 'objection'
-    start_seconds REAL NOT NULL,
-    end_seconds REAL NOT NULL,
-    question TEXT NOT NULL,           -- qa: the question; objection: the objection/claim
-    answer TEXT NOT NULL,             -- qa: the answer; objection: the rebuttal
-    speaker TEXT,
-    topics TEXT,                      -- JSON array
-    confidence REAL,
-    embedding BLOB,                   -- float32 bytes when embedded
-    embed_text TEXT,                  -- the text that was embedded (for debugging)
-    created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_chunks_video ON chunks(video_id);
-CREATE INDEX IF NOT EXISTS idx_chunks_kind ON chunks(kind);
-CREATE INDEX IF NOT EXISTS idx_chunks_unembedded ON chunks(id) WHERE embedding IS NULL;
-"""
+from .config import Config
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    # Migrations must run before SCHEMA: the SCHEMA's indexes reference columns
-    # added by the migration on already-existing DBs.
-    _migrate_pre_schema(conn)
-    conn.executescript(SCHEMA)
-    return conn
-
-
-def _migrate_pre_schema(conn: sqlite3.Connection) -> None:
-    """Apply column-add migrations for DBs created before a column was introduced."""
-    has_videos = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='videos'"
-    ).fetchone()
-    if not has_videos:
-        return
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)").fetchall()}
-    if "form" not in cols:
-        conn.execute("ALTER TABLE videos ADD COLUMN form TEXT NOT NULL DEFAULT 'unknown'")
-        conn.commit()
-
-
-@contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+# ────────────────────────────────────────────────────────────────────────────
+# Embedding helpers (still useful for client-side numpy work)
+# ────────────────────────────────────────────────────────────────────────────
 
 
 def encode_embedding(vec: list[float] | np.ndarray) -> bytes:
@@ -105,81 +36,238 @@ def decode_embedding(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.float32)
 
 
-def upsert_channel(conn: sqlite3.Connection, channel_id: str, handle: str, display_name: str | None) -> None:
-    conn.execute(
-        "INSERT INTO channels (id, handle, display_name) VALUES (?, ?, ?) "
-        "ON CONFLICT(id) DO UPDATE SET handle=excluded.handle, display_name=excluded.display_name",
-        (channel_id, handle, display_name),
-    )
+# ────────────────────────────────────────────────────────────────────────────
+# ApiClient
+# ────────────────────────────────────────────────────────────────────────────
 
 
-def upsert_video(
-    conn: sqlite3.Connection,
-    *,
-    video_id: str,
-    channel_id: str,
-    title: str,
-    duration_seconds: int | None,
-    thumbnail_url: str | None,
-    published_at: str | None,
-    form: str = "unknown",
-) -> bool:
-    """Insert or update a video row. Returns True if it was newly inserted (vs. updated)."""
-    existed = conn.execute("SELECT 1 FROM videos WHERE id = ?", (video_id,)).fetchone() is not None
-    conn.execute(
-        "INSERT INTO videos (id, channel_id, title, duration_seconds, thumbnail_url, published_at, form, ingest_status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending') "
-        "ON CONFLICT(id) DO UPDATE SET "
-        "  title=excluded.title, "
-        "  duration_seconds=COALESCE(excluded.duration_seconds, videos.duration_seconds), "
-        "  thumbnail_url=COALESCE(excluded.thumbnail_url, videos.thumbnail_url), "
-        "  published_at=COALESCE(excluded.published_at, videos.published_at), "
-        "  form=CASE WHEN excluded.form != 'unknown' THEN excluded.form ELSE videos.form END",
-        (video_id, channel_id, title, duration_seconds, thumbnail_url, published_at, form),
-    )
-    return not existed
+class ApiError(RuntimeError):
+    def __init__(self, status: int, body: str | dict[str, Any]):
+        self.status = status
+        self.body = body
+        super().__init__(f"API {status}: {body}")
 
 
-def mark_video(conn: sqlite3.Connection, video_id: str, status: str, **fields: object) -> None:
-    """Update a video's status plus any extra columns. Sets the matching <status>_at timestamp when applicable."""
-    cols = ["ingest_status = ?"]
-    vals: list[object] = [status]
-    for k, v in fields.items():
-        cols.append(f"{k} = ?")
-        vals.append(v)
-    if status in {"transcribed", "chunked", "embedded"}:
-        cols.append(f"{status}_at = datetime('now')")
-    vals.append(video_id)
-    conn.execute(f"UPDATE videos SET {', '.join(cols)} WHERE id = ?", vals)
+class ApiClient:
+    """Thin wrapper over the AYC Worker's internal API.
 
+    Construct once per CLI invocation (it owns an httpx.Client connection pool).
+    Use as a context manager or call `close()` when done.
+    """
 
-def insert_chunk(
-    conn: sqlite3.Connection,
-    *,
-    chunk_id: str,
-    video_id: str,
-    kind: str,
-    start_seconds: float,
-    end_seconds: float,
-    question: str,
-    answer: str,
-    speaker: str | None,
-    topics: list[str] | None,
-    confidence: float | None,
-) -> None:
-    conn.execute(
-        "INSERT INTO chunks (id, video_id, kind, start_seconds, end_seconds, question, answer, speaker, topics, confidence) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            chunk_id,
-            video_id,
-            kind,
-            start_seconds,
-            end_seconds,
-            question,
-            answer,
-            speaker,
-            json.dumps(topics) if topics is not None else None,
-            confidence,
-        ),
-    )
+    def __init__(self, cfg: Config, *, timeout: float = 60.0) -> None:
+        self.base_url = cfg.api_base_url.rstrip("/")
+        self.token = cfg.api_token
+        if not self.token:
+            raise RuntimeError("AYC_API_TOKEN is required (set in .env)")
+        self._client = httpx.Client(
+            base_url=self.base_url,
+            timeout=timeout,
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+
+    # ── lifecycle ──
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "ApiClient":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # ── retry-aware request helper ──
+
+    def _req(self, method: str, path: str, *, json_body: Any = None, content: bytes | None = None,
+             headers: dict[str, str] | None = None, retries: int = 3) -> httpx.Response:
+        last_err: Exception | None = None
+        for attempt in range(retries):
+            try:
+                resp = self._client.request(
+                    method,
+                    path,
+                    json=json_body,
+                    content=content,
+                    headers=headers,
+                )
+            except httpx.RequestError as e:
+                last_err = e
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                last_err = ApiError(resp.status_code, resp.text)
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            if resp.status_code >= 400:
+                try:
+                    body: Any = resp.json()
+                except Exception:
+                    body = resp.text
+                raise ApiError(resp.status_code, body)
+            return resp
+        # Out of retries
+        raise last_err if last_err else ApiError(0, "request failed without exception")
+
+    # ── stats ──
+
+    def stats(self) -> dict[str, Any]:
+        return self._req("GET", "/internal/stats").json()
+
+    # ── channels ──
+
+    def upsert_channel(
+        self,
+        channel_id: str,
+        handle: str,
+        display_name: str | None,
+        *,
+        submitted_by_email: str | None = None,
+    ) -> None:
+        self._req(
+            "POST",
+            "/internal/channels",
+            json_body={
+                "id": channel_id,
+                "handle": handle,
+                "display_name": display_name,
+                "submitted_by_email": submitted_by_email,
+            },
+        )
+
+    # ── videos ──
+
+    def upsert_videos_bulk(self, videos: list[dict[str, Any]]) -> int:
+        """POST a batch of video dicts. Each row may contain id, channel_id, title,
+        duration_seconds, thumbnail_url, published_at, form, ingest_status."""
+        if not videos:
+            return 0
+        # Server caps at 500/call; chunk locally just in case.
+        total = 0
+        for i in range(0, len(videos), 500):
+            batch = videos[i : i + 500]
+            r = self._req("POST", "/internal/videos:bulk", json_body={"videos": batch})
+            total += r.json().get("processed", 0)
+        return total
+
+    def list_videos(
+        self,
+        *,
+        channel_id: str | None = None,
+        status: str | None = None,
+        form: str | None = None,
+        limit: int = 100,
+    ) -> Iterator[dict[str, Any]]:
+        """Generator: pages through /internal/videos until exhausted."""
+        cursor: str | None = None
+        while True:
+            params: dict[str, str] = {"limit": str(limit)}
+            if channel_id:
+                params["channel_id"] = channel_id
+            if status:
+                params["status"] = status
+            if form:
+                params["form"] = form
+            if cursor:
+                params["cursor"] = cursor
+            r = self._client.get("/internal/videos", params=params)
+            r.raise_for_status()
+            data = r.json()
+            for v in data.get("videos", []):
+                yield v
+            cursor = data.get("next_cursor")
+            if not cursor:
+                return
+
+    def mark_video(self, video_id: str, status: str, error: str | None = None) -> None:
+        self._req(
+            "POST",
+            f"/internal/videos/{video_id}/mark",
+            json_body={"status": status, "error": error},
+        )
+
+    # ── transcripts (R2-backed) ──
+
+    def put_transcript(self, video_id: str, payload: dict[str, Any], *, source: str = "auto") -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self._req(
+            "POST",
+            f"/internal/videos/{video_id}/transcript",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Transcript-Source": source,
+            },
+        )
+
+    def get_transcript(self, video_id: str) -> dict[str, Any]:
+        r = self._req("GET", f"/internal/videos/{video_id}/transcript")
+        return r.json()
+
+    # ── chunks (relational) ──
+
+    def insert_chunks_bulk(
+        self,
+        video_id: str,
+        chunks: list[dict[str, Any]],
+        *,
+        replace: bool = True,
+    ) -> int:
+        """POST chunks for a video. Server deletes prior chunks (if replace) and
+        marks the video 'chunked' transactionally."""
+        # Server caps at 500/call.
+        total = 0
+        for i in range(0, len(chunks), 500):
+            batch = chunks[i : i + 500]
+            r = self._req(
+                "POST",
+                "/internal/chunks:bulk",
+                json_body={
+                    "video_id": video_id,
+                    "replace": replace and i == 0,
+                    "chunks": batch,
+                },
+            )
+            total += r.json().get("inserted", 0)
+        return total
+
+    def unembedded_chunks(self, limit: int = 100) -> list[dict[str, Any]]:
+        r = self._req("GET", f"/internal/chunks/unembedded?limit={limit}")
+        return r.json().get("chunks", [])
+
+    def embeddings_bulk(self, items: list[dict[str, Any]]) -> int:
+        """POST {id, vector} items. Server upserts to Vectorize, sets embedded_at,
+        rolls videos to 'embedded' as their last chunk lands."""
+        if not items:
+            return 0
+        total = 0
+        for i in range(0, len(items), 500):
+            batch = items[i : i + 500]
+            r = self._req(
+                "POST",
+                "/internal/chunks/embeddings:bulk",
+                json_body={"items": batch},
+            )
+            total += r.json().get("upserted", 0)
+        return total
+
+    # ── vector query ──
+
+    def vector_query(
+        self,
+        vector: list[float],
+        *,
+        top_k: int = 20,
+        channel_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        body: dict[str, Any] = {"vector": vector, "top_k": top_k}
+        flt: dict[str, str] = {}
+        if channel_id:
+            flt["channel_id"] = channel_id
+        if kind:
+            flt["kind"] = kind
+        if flt:
+            body["filter"] = flt
+        r = self._req("POST", "/internal/vector/query", json_body=body)
+        return r.json().get("matches", [])

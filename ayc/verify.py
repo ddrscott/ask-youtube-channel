@@ -22,12 +22,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .transcripts import load_transcript
+from .transcripts import Transcript, TranscriptSegment
 
 
 # Tolerance: a chunk's start/end timestamp can be up to N seconds off from
 # the closest transcript segment boundary before we flag it.
 TIMESTAMP_TOLERANCE_SECONDS = 5.0
+
+
+def _load_transcript_from_pending(pending_dir: Path, video_id: str) -> Transcript | None:
+    """Read a transcript out of the queue/pending/<id>.json file the chunker
+    saw. Same on-disk shape as queue.write_pending() emits."""
+    path = pending_dir / f"{video_id}.json"
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return Transcript(
+        video_id=data["video_id"],
+        source=data.get("transcript_source", "unknown"),
+        duration_seconds=float(data.get("duration_seconds", 0.0)),
+        segments=[TranscriptSegment(**s) for s in data.get("segments", [])],
+    )
 
 
 @dataclass
@@ -81,10 +96,10 @@ def verify_chunks_file(path: Path, transcripts_dir: Path) -> FileVerification:
         fv.issues.append(Issue("error", -1, "chunks", f"chunks must be a list, got {type(chunks).__name__}"))
         return fv
 
-    transcript = load_transcript(transcripts_dir, video_id)
+    transcript = _load_transcript_from_pending(transcripts_dir, video_id)
     if transcript is None:
         fv.issues.append(
-            Issue("error", -1, "<transcript>", f"no transcript on disk for video {video_id} (looked in {transcripts_dir})")
+            Issue("error", -1, "<transcript>", f"no pending transcript for video {video_id} (looked in {transcripts_dir})")
         )
         return fv
 

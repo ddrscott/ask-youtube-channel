@@ -1,15 +1,18 @@
-"""Transcript fetching via yt-dlp + JSON3 parsing with rolling-caption dedupe."""
+"""Transcript fetching via yt-dlp + JSON3 parsing with rolling-caption dedupe.
+
+Transcripts are streamed to R2 via the cloud API; nothing persists locally
+beyond the temp dir used during yt-dlp invocation.
+"""
 
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from .db import mark_video
+from .db import ApiClient
 
 
 @dataclass
@@ -25,6 +28,14 @@ class Transcript:
     source: str  # 'auto' | 'manual'
     duration_seconds: float
     segments: list[TranscriptSegment]
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "video_id": self.video_id,
+            "source": self.source,
+            "duration_seconds": self.duration_seconds,
+            "segments": [asdict(s) for s in self.segments],
+        }
 
 
 def _run_yt_dlp_subs(video_id: str, out_dir: Path, manual: bool) -> Path | None:
@@ -58,7 +69,6 @@ def _parse_json3(path: Path) -> list[TranscriptSegment]:
     data = json.loads(path.read_text(encoding="utf-8"))
     events = data.get("events") or []
 
-    # Emit (absolute_start_ms, text) for every non-empty utf8 segment.
     words: list[tuple[int, str]] = []
     for event in events:
         t_start = event.get("tStartMs") or 0
@@ -69,18 +79,14 @@ def _parse_json3(path: Path) -> list[TranscriptSegment]:
             offset = seg.get("tOffsetMs") or 0
             words.append((t_start + offset, text))
 
-    # Dedupe identical (start_ms, text) pairs — rolling captions repeat the same word
-    # at the same timestamp across overlapping events.
     seen: set[tuple[int, str]] = set()
     deduped: list[tuple[int, str]] = []
     for w in words:
         if w not in seen:
             seen.add(w)
             deduped.append(w)
-
     deduped.sort(key=lambda w: w[0])
 
-    # Group into ~5-second segments for chunker readability.
     segments: list[TranscriptSegment] = []
     current_start_ms: int | None = None
     current_text: list[str] = []
@@ -113,16 +119,15 @@ def _parse_json3(path: Path) -> list[TranscriptSegment]:
                 text="".join(current_text).strip(),
             )
         )
-
     return [s for s in segments if s.text]
 
 
-def fetch_transcript(video_id: str, transcripts_dir: Path) -> Transcript | None:
-    """Fetch a transcript for a video. Tries manual captions first, then auto-subs."""
+def fetch_transcript(video_id: str) -> Transcript | None:
+    """Fetch a transcript for a video. Tries manual captions first, then auto-subs.
+    Nothing persists locally — caller is responsible for shipping it to R2."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
 
-        # Manual captions first (higher quality, line-level timestamps already)
         path = _run_yt_dlp_subs(video_id, tmp_path, manual=True)
         source = "manual"
         if not path:
@@ -135,69 +140,37 @@ def fetch_transcript(video_id: str, transcripts_dir: Path) -> Transcript | None:
         if not segments:
             return None
 
-        # Persist normalized transcript
-        out_path = transcripts_dir / f"{video_id}.json"
-        duration = segments[-1].end
-        out_path.write_text(
-            json.dumps(
-                {
-                    "video_id": video_id,
-                    "source": source,
-                    "duration_seconds": duration,
-                    "segments": [
-                        {"start": s.start, "end": s.end, "text": s.text} for s in segments
-                    ],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        # Also keep the raw JSON3 for debugging
-        raw_dest = transcripts_dir / f"{video_id}.json3"
-        shutil.copy2(path, raw_dest)
-
         return Transcript(
             video_id=video_id,
             source=source,
-            duration_seconds=duration,
+            duration_seconds=segments[-1].end,
             segments=segments,
         )
 
 
-def load_transcript(transcripts_dir: Path, video_id: str) -> Transcript | None:
-    path = transcripts_dir / f"{video_id}.json"
-    if not path.exists():
-        return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return Transcript(
-        video_id=data["video_id"],
-        source=data["source"],
-        duration_seconds=data["duration_seconds"],
-        segments=[TranscriptSegment(**s) for s in data["segments"]],
-    )
+def transcribe_video(client: ApiClient, video_id: str) -> Transcript | None:
+    """Fetch a transcript via yt-dlp and PUT it to R2 via the API.
 
-
-def transcribe_video(conn, video_id: str, transcripts_dir: Path) -> Transcript | None:
-    """Fetch the transcript and update the videos row. Returns the transcript or None on failure."""
-    transcript = fetch_transcript(video_id, transcripts_dir)
+    Updates the video status to 'transcribed' (set server-side by the put_transcript
+    endpoint) or 'skipped_no_captions' if nothing was available.
+    """
+    transcript = fetch_transcript(video_id)
     if transcript is None:
-        mark_video(
-            conn,
+        client.mark_video(
             video_id,
             "skipped_no_captions",
             error="no captions available (manual or auto)",
         )
-        conn.commit()
         return None
-    mark_video(
-        conn,
-        video_id,
-        "transcribed",
-        transcript_source=transcript.source,
-        transcript_path=str(transcripts_dir / f"{video_id}.json"),
-        error=None,
-    )
-    conn.commit()
+    client.put_transcript(video_id, transcript.to_payload(), source=transcript.source)
     return transcript
+
+
+def transcript_from_payload(data: dict[str, object]) -> Transcript:
+    """Reconstruct a Transcript from the JSON returned by GET /internal/videos/:id/transcript."""
+    return Transcript(
+        video_id=data["video_id"],  # type: ignore[arg-type]
+        source=data["source"],  # type: ignore[arg-type]
+        duration_seconds=data["duration_seconds"],  # type: ignore[arg-type]
+        segments=[TranscriptSegment(**s) for s in data["segments"]],  # type: ignore[arg-type]
+    )

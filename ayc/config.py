@@ -15,36 +15,49 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 @dataclass(frozen=True)
 class Config:
-    anthropic_api_key: str
+    # Cloud API (replaces local SQLite)
+    api_base_url: str
+    api_token: str
+
+    # External AI APIs (still client-side)
     openai_api_key: str
-    chunker_model: str
-    query_model: str
+
+    # Models
     embed_model: str
-    db_path: Path
-    transcripts_dir: Path
+
+    # Local working directories (filesystem queue lives on)
+    transcripts_dir: Path  # local cache of pulled transcripts before R2 upload
+    queue_dir: Path
 
     @classmethod
     def load(cls) -> "Config":
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        api_base = os.environ.get("AYC_API_BASE_URL", "").strip()
+        api_token = os.environ.get("AYC_API_TOKEN", "").strip()
         openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if not anthropic_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is required (set in env or .env)")
+
+        if not api_base:
+            raise RuntimeError(
+                "AYC_API_BASE_URL is required (set in env or .env, e.g. https://ayc.ljs.app)"
+            )
+        if not api_token:
+            raise RuntimeError("AYC_API_TOKEN is required (set in env or .env)")
         if not openai_key:
             raise RuntimeError("OPENAI_API_KEY is required (set in env or .env)")
 
-        db_path = Path(os.environ.get("AYC_DB_PATH", REPO_ROOT / "data" / "ayc.db")).resolve()
         transcripts_dir = Path(
             os.environ.get("AYC_TRANSCRIPTS_DIR", REPO_ROOT / "data" / "transcripts")
         ).resolve()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        queue_dir = Path(
+            os.environ.get("AYC_QUEUE_DIR", REPO_ROOT / "queue")
+        ).resolve()
         transcripts_dir.mkdir(parents=True, exist_ok=True)
+        queue_dir.mkdir(parents=True, exist_ok=True)
 
         return cls(
-            anthropic_api_key=anthropic_key,
+            api_base_url=api_base,
+            api_token=api_token,
             openai_api_key=openai_key,
-            chunker_model=os.environ.get("AYC_CHUNKER_MODEL", "claude-opus-4-7"),
-            query_model=os.environ.get("AYC_QUERY_MODEL", "claude-opus-4-7"),
             embed_model=os.environ.get("AYC_EMBED_MODEL", "text-embedding-3-small"),
-            db_path=db_path,
             transcripts_dir=transcripts_dir,
+            queue_dir=queue_dir,
         )

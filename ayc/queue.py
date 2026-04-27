@@ -1,12 +1,15 @@
 """Filesystem queue for Claude Code agent-based chunking.
 
 Workflow:
-    1. `ayc queue prepare`     — Python writes transcripts to queue/pending/<id>.json
+    1. `ayc queue prepare`     — Python pulls transcripts from R2 via the API
+       and writes them to queue/pending/<id>.json
     2. Claude Code dispatches  the `ayc-chunker` agent for each pending file.
        The agent writes      queue/completed/<id>.chunks.json  (or  queue/failed/<id>.error.txt)
-    3. `ayc queue merge`       — Python reads queue/completed/*, inserts chunks into the DB.
+    3. `ayc queue merge`       — Python reads queue/completed/*, posts chunks to
+       /internal/chunks:bulk (which transactionally deletes prior chunks,
+       inserts new ones, and marks the video 'chunked').
 
-This keeps deterministic state (DB, transcripts, embeddings) in Python and the
+This keeps deterministic state (D1, R2, Vectorize) in the cloud and the
 LLM-shaped work (extracting Q&A and objection moments) in Claude Code subagents,
 which run against the user's Claude Code subscription rather than the API.
 """
@@ -15,14 +18,13 @@ from __future__ import annotations
 
 import json
 import shutil
-import sqlite3
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import REPO_ROOT
-from .db import insert_chunk, mark_video
-from .transcripts import load_transcript
+from .config import REPO_ROOT, Config
+from .db import ApiClient
+from .transcripts import transcript_from_payload
 from .verify import quarantine_invalid, verify_completed_dir
 
 
@@ -83,54 +85,57 @@ def write_pending(
 
 
 def prepare_pending(
-    conn: sqlite3.Connection,
-    transcripts_dir: Path,
+    cfg: Config,
+    client: ApiClient,
     *,
     form: str = "all",
     limit: int = 0,
 ) -> tuple[int, int]:
-    """For every transcribed video without chunks yet, write its transcript into queue/pending/.
+    """For every transcribed video without chunks yet, fetch its transcript from R2
+    and write it into queue/pending/.
 
-    Returns (written, skipped). Skipped means transcript file missing on disk.
+    Returns (written, skipped). Skipped means the transcript wasn't available on R2.
     """
-    sql = (
-        "SELECT id, title, form, duration_seconds FROM videos "
-        "WHERE ingest_status = 'transcribed'"
-    )
-    params: list[object] = []
-    if form != "all":
-        sql += " AND form = ?"
-        params.append(form)
-    sql += " ORDER BY id"
-    rows = conn.execute(sql, params).fetchall()
-    if limit:
-        rows = rows[:limit]
-
     written = 0
     skipped = 0
-    for row in rows:
-        transcript = load_transcript(transcripts_dir, row["id"])
-        if transcript is None:
+    seen = 0
+    target = limit if limit else None
+
+    list_kwargs: dict[str, str | int] = {"status": "transcribed", "limit": 200}
+    if form != "all":
+        list_kwargs["form"] = form
+
+    for video in client.list_videos(**list_kwargs):  # type: ignore[arg-type]
+        if target is not None and seen >= target:
+            break
+        seen += 1
+        try:
+            payload = client.get_transcript(video["id"])
+        except Exception:
             skipped += 1
             continue
+        transcript = transcript_from_payload(payload)
         write_pending(
-            video_id=row["id"],
-            title=row["title"],
-            form=row["form"],
+            video_id=video["id"],
+            title=video["title"],
+            form=video["form"],
             duration_seconds=transcript.duration_seconds,
             transcript_source=transcript.source,
             segments=[
-                {"start": s.start, "end": s.end, "text": s.text} for s in transcript.segments
+                {"start": s.start, "end": s.end, "text": s.text}
+                for s in transcript.segments
             ],
         )
         written += 1
+
+    # cfg used to be the transcripts_dir source; keep it in the signature so
+    # CLI callers don't break if they pass it positionally.
+    _ = cfg
     return written, skipped
 
 
-def merge_completed(
-    conn: sqlite3.Connection, transcripts_dir: Path
-) -> tuple[int, int, int, int]:
-    """Read every queue/completed/*.chunks.json and insert chunks into the DB.
+def merge_completed(client: ApiClient) -> tuple[int, int, int, int]:
+    """Read every queue/completed/*.chunks.json and POST chunks to the API.
 
     Verifies each file against its source transcript first. Files with errors
     are quarantined to queue/failed/ before merging starts.
@@ -142,9 +147,10 @@ def merge_completed(
     """
     ensure_dirs()
 
-    # Defense-in-depth: verify every file before merging. Anything broken
-    # gets quarantined to queue/failed/ with a .verify-error.txt sibling.
-    verifications = verify_completed_dir(COMPLETED_DIR, transcripts_dir)
+    # Defense-in-depth: verify every file before merging.
+    # The verifier reads transcripts from queue/pending/ files (already on disk),
+    # so it doesn't need a transcripts dir or API access.
+    verifications = verify_completed_dir(COMPLETED_DIR, PENDING_DIR)
     quarantined = quarantine_invalid(verifications, FAILED_DIR)
 
     files = sorted(COMPLETED_DIR.glob("*.chunks.json"))
@@ -158,30 +164,27 @@ def merge_completed(
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             video_id = data["video_id"]
-            chunk_list = data["chunks"]
-            # Validate schema version (forward compat)
+            raw_chunks = data["chunks"]
             if data.get("schema_version", 1) > COMPLETED_SCHEMA_VERSION:
                 raise ValueError(f"unknown schema_version {data['schema_version']}")
-            # Replace any prior chunks for this video
-            conn.execute("DELETE FROM chunks WHERE video_id = ?", (video_id,))
-            for c in chunk_list:
-                insert_chunk(
-                    conn,
-                    chunk_id=uuid.uuid4().hex,
-                    video_id=video_id,
-                    kind=c["kind"],
-                    start_seconds=float(c["start_seconds"]),
-                    end_seconds=float(c["end_seconds"]),
-                    question=c["question"],
-                    answer=c["answer"],
-                    speaker=c.get("speaker"),
-                    topics=c.get("topics") or [],
-                    confidence=float(c.get("confidence", 0.5)),
-                )
-            mark_video(conn, video_id, "chunked", error=None)
-            conn.commit()
+
+            payload_chunks = [
+                {
+                    "id": uuid.uuid4().hex,
+                    "kind": c["kind"],
+                    "start_seconds": float(c["start_seconds"]),
+                    "end_seconds": float(c["end_seconds"]),
+                    "question": c["question"],
+                    "answer": c["answer"],
+                    "speaker": c.get("speaker"),
+                    "topics": c.get("topics") or [],
+                    "confidence": float(c.get("confidence", 0.5)),
+                }
+                for c in raw_chunks
+            ]
+            client.insert_chunks_bulk(video_id, payload_chunks, replace=True)
             videos += 1
-            chunks += len(chunk_list)
+            chunks += len(raw_chunks)
             # Archive the completed file and remove the pending file
             shutil.move(str(path), str(ARCHIVE_DIR / path.name))
             pending = PENDING_DIR / f"{video_id}.json"
