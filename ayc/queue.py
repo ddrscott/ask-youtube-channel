@@ -90,48 +90,98 @@ def prepare_pending(
     *,
     form: str = "all",
     limit: int = 0,
+    rechunk: bool = False,
 ) -> tuple[int, int]:
-    """For every transcribed video without chunks yet, fetch its transcript from R2
-    and write it into queue/pending/.
+    """Fetch transcripts and write queue/pending/<id>.json files.
 
-    Returns (written, skipped). Skipped means the transcript wasn't available on R2.
+    By default: only videos at status='transcribed' (i.e. transcribed but not
+    yet chunked).
+
+    With ``rechunk=True``: include status in {'chunked', 'embedded'} as well —
+    used by the rechunk runbook to re-process previously-chunked content under
+    updated chunker rules. The merge step's ``replace=True`` semantics will
+    delete the old chunks and their Vectorize entries before inserting fresh.
+
+    Returns ``(written, skipped)``. Skipped means the transcript fetch failed.
     """
+    statuses: list[str] = ["transcribed"]
+    if rechunk:
+        statuses.extend(["chunked", "embedded"])
+
     written = 0
     skipped = 0
     seen = 0
     target = limit if limit else None
 
-    list_kwargs: dict[str, str | int] = {"status": "transcribed", "limit": 200}
-    if form != "all":
-        list_kwargs["form"] = form
-
-    for video in client.list_videos(**list_kwargs):  # type: ignore[arg-type]
+    for status in statuses:
         if target is not None and seen >= target:
             break
-        seen += 1
-        try:
-            payload = client.get_transcript(video["id"])
-        except Exception:
-            skipped += 1
-            continue
-        transcript = transcript_from_payload(payload)
-        write_pending(
-            video_id=video["id"],
-            title=video["title"],
-            form=video["form"],
-            duration_seconds=transcript.duration_seconds,
-            transcript_source=transcript.source,
-            segments=[
-                {"start": s.start, "end": s.end, "text": s.text}
-                for s in transcript.segments
-            ],
-        )
-        written += 1
+        list_kwargs: dict[str, str | int] = {"status": status, "limit": 200}
+        if form != "all":
+            list_kwargs["form"] = form
+        for video in client.list_videos(**list_kwargs):  # type: ignore[arg-type]
+            if target is not None and seen >= target:
+                break
+            seen += 1
+            try:
+                payload = client.get_transcript(video["id"])
+            except Exception:
+                skipped += 1
+                continue
+            transcript = transcript_from_payload(payload)
+            write_pending(
+                video_id=video["id"],
+                title=video["title"],
+                form=video["form"],
+                duration_seconds=transcript.duration_seconds,
+                transcript_source=transcript.source,
+                segments=[
+                    {"start": s.start, "end": s.end, "text": s.text}
+                    for s in transcript.segments
+                ],
+            )
+            written += 1
 
     # cfg used to be the transcripts_dir source; keep it in the signature so
     # CLI callers don't break if they pass it positionally.
     _ = cfg
     return written, skipped
+
+
+def prepare_single(client: ApiClient, video_id: str) -> bool:
+    """Write a single pending file for one specific video. Returns True if
+    written, False if the transcript could not be fetched.
+
+    Used by the rechunk runbook's single-video mode. Looks the video up by
+    iterating list_videos across statuses — costs ~one paginated API call,
+    which is fine for a one-off."""
+    target: dict | None = None
+    for status in ("chunked", "embedded", "transcribed"):
+        for v in client.list_videos(status=status, limit=200):
+            if v["id"] == video_id:
+                target = v
+                break
+        if target is not None:
+            break
+    if target is None:
+        return False
+    try:
+        payload = client.get_transcript(video_id)
+    except Exception:
+        return False
+    transcript = transcript_from_payload(payload)
+    write_pending(
+        video_id=video_id,
+        title=target.get("title") or video_id,
+        form=target.get("form") or "long",
+        duration_seconds=transcript.duration_seconds,
+        transcript_source=transcript.source,
+        segments=[
+            {"start": s.start, "end": s.end, "text": s.text}
+            for s in transcript.segments
+        ],
+    )
+    return True
 
 
 def merge_completed(client: ApiClient) -> tuple[int, int, int, int]:

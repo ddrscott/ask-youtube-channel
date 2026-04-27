@@ -175,14 +175,27 @@ app.add_typer(queue_app)
 def queue_prepare(
     form: str = typer.Option("all", help="Restrict to long-form, shorts, or all"),
     limit: int = typer.Option(0, help="Limit number of files written (0 = all)"),
+    rechunk: bool = typer.Option(
+        False,
+        "--rechunk",
+        help="Include already-chunked and already-embedded videos. Used by the "
+        "rechunk runbook to re-process under updated chunker rules.",
+    ),
 ) -> None:
-    """Pull transcripts for transcribed-but-not-yet-chunked videos and write them
-    into queue/pending/. The ayc-chunker Claude Code agent picks them up from there."""
+    """Pull transcripts and write queue/pending/<id>.json files for the
+    ayc-chunker agent.
+
+    Default: only videos at status='transcribed'.
+    With --rechunk: also include 'chunked' and 'embedded' videos so the merge
+    step replaces their old chunks (and Vectorize entries) atomically."""
     cfg = _cfg()
     with ApiClient(cfg) as client:
-        written, skipped = prepare_pending(cfg, client, form=form, limit=limit)
+        written, skipped = prepare_pending(
+            cfg, client, form=form, limit=limit, rechunk=rechunk
+        )
+    mode = " (rechunk mode)" if rechunk else ""
     console.print(
-        f"[green]Wrote:[/green] {written} pending file(s) to {PENDING_DIR}\n"
+        f"[green]Wrote:[/green] {written} pending file(s){mode} to {PENDING_DIR}\n"
         f"[yellow]Skipped:[/yellow] {skipped} (transcript fetch failed)"
     )
 
