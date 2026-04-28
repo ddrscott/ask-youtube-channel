@@ -148,6 +148,84 @@ def prepare_pending(
     return written, skipped
 
 
+def augment_pending_for_gapfill(client: ApiClient) -> tuple[int, int]:
+    """Mutate every queue/pending/<id>.json to include gap-fill metadata:
+
+      * ``gap_fill: true``
+      * ``existing_chunks``: list of {kind, start_seconds, end_seconds,
+        question, topics} for chunks already in D1 — given to the agent so it
+        knows what NOT to re-extract.
+      * ``covered_ranges``: merged [(start, end), ...] in seconds.
+      * ``gap_ranges``: list of [start, end, dur] tuples for any window of
+        >=60 continuous seconds that no existing chunk overlaps.
+
+    The chunker reads these and emits ONLY chunks that fall inside a gap
+    range. The merge step's gap-fill mode then POSTs them with replace=False,
+    so existing chunks (and Vectorize entries) are preserved and the run is
+    purely additive.
+
+    Returns (augmented, skipped). Skipped means the API didn't have chunks.
+    """
+    GAP_THRESHOLD = 60.0
+    augmented = 0
+    skipped = 0
+    for path in sorted(PENDING_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            skipped += 1
+            continue
+        video_id = data.get("video_id")
+        if not video_id:
+            skipped += 1
+            continue
+        try:
+            existing = client.list_video_chunks(video_id)
+        except Exception:
+            skipped += 1
+            continue
+        # Sort + merge overlapping ranges
+        spans = sorted(
+            [(float(c["start_seconds"]), float(c["end_seconds"])) for c in existing]
+        )
+        merged: list[tuple[float, float]] = []
+        for s, e in spans:
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        # Compute gaps relative to the full duration.
+        dur = float(data.get("duration_seconds") or 0)
+        gaps: list[list[float]] = []
+        prev = 0.0
+        for s, e in merged:
+            if s - prev >= GAP_THRESHOLD:
+                gaps.append([round(prev, 2), round(s, 2), round(s - prev, 2)])
+            prev = e
+        if dur and dur - prev >= GAP_THRESHOLD:
+            gaps.append([round(prev, 2), round(dur, 2), round(dur - prev, 2)])
+        # Slim payload — drop the answer text since the agent shouldn't be
+        # using it as a reference (it'd make the agent verbose). Keep
+        # question + topics so it knows the topical territory already covered.
+        existing_min = [
+            {
+                "kind": c["kind"],
+                "start_seconds": float(c["start_seconds"]),
+                "end_seconds": float(c["end_seconds"]),
+                "question": c.get("question") or "",
+                "topics": json.loads(c["topics"]) if c.get("topics") else [],
+            }
+            for c in existing
+        ]
+        data["gap_fill"] = True
+        data["existing_chunks"] = existing_min
+        data["covered_ranges"] = [[round(s, 2), round(e, 2)] for s, e in merged]
+        data["gap_ranges"] = gaps
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        augmented += 1
+    return augmented, skipped
+
+
 def prepare_single(client: ApiClient, video_id: str) -> bool:
     """Write a single pending file for one specific video. Returns True if
     written, False if the transcript could not be fetched.
@@ -232,9 +310,40 @@ def merge_completed(client: ApiClient) -> tuple[int, int, int, int]:
                 }
                 for c in raw_chunks
             ]
-            client.insert_chunks_bulk(video_id, payload_chunks, replace=True)
+            # Detect gap-fill mode by reading the pending file's gap_fill flag.
+            # In that mode the merge is purely additive (replace=False) AND we
+            # programmatically filter out any chunks that don't substantially
+            # overlap a declared gap window. The chunker tends to do a fresh
+            # full-pass when given the transcript, regardless of the gap_fill
+            # instruction — this filter is the hard guarantee that the run
+            # only ADDS chunks in genuinely uncovered territory.
+            pending_file = PENDING_DIR / f"{video_id}.json"
+            replace_mode = True
+            gap_ranges: list[list[float]] = []
+            if pending_file.exists():
+                try:
+                    pdata = json.loads(pending_file.read_text(encoding="utf-8"))
+                    if pdata.get("gap_fill"):
+                        replace_mode = False
+                        gap_ranges = pdata.get("gap_ranges", [])
+                except Exception:
+                    pass
+            if not replace_mode and gap_ranges:
+                MIN_OVERLAP = 20.0  # seconds of chunk inside a gap to keep it
+                kept: list[dict] = []
+                for ch in payload_chunks:
+                    s, e = ch["start_seconds"], ch["end_seconds"]
+                    overlap_total = 0.0
+                    for gs, ge, _ in gap_ranges:
+                        overlap = max(0.0, min(e, ge) - max(s, gs))
+                        overlap_total += overlap
+                    if overlap_total >= MIN_OVERLAP:
+                        kept.append(ch)
+                payload_chunks = kept
+            if payload_chunks:
+                client.insert_chunks_bulk(video_id, payload_chunks, replace=replace_mode)
             videos += 1
-            chunks += len(raw_chunks)
+            chunks += len(payload_chunks)
             # Archive the completed file and remove the pending file
             shutil.move(str(path), str(ARCHIVE_DIR / path.name))
             pending = PENDING_DIR / f"{video_id}.json"

@@ -17,6 +17,18 @@ You are the AYC chunker. You extract structured Q&A and objection-rebuttal momen
 
 You do NOT delete the pending file. The Python merge step does that. You do NOT modify the database. You only write the chunks file.
 
+## Two modes
+
+The pending file may include a top-level `"gap_fill": true` flag. Behavior splits:
+
+* **Default mode** (no `gap_fill`, or `gap_fill: false`): you are extracting from scratch. Walk the entire transcript and emit every distinct moment per the rules below. Output replaces any prior chunks for the video on merge.
+
+* **Gap-fill mode** (`"gap_fill": true`): the pending file ALSO includes `existing_chunks` (already-extracted moments) and `gap_ranges` (windows of >=60 seconds with no existing coverage). **You must extract chunks ONLY inside those gap ranges.** Do not re-extract anything covered by `existing_chunks`. The merge step appends your output to the existing chunks (replace=False), so duplicates are real duplicates — they pollute the index.
+
+  In gap-fill mode, walk each gap range. Read the segments inside it. Decide if a substantive Q&A or objection-rebuttal happened in that window. If yes, emit a chunk. If the window is genuinely filler (banter, sign-reading, ambient, transition), emit nothing. Empty output for a gap is acceptable when there's truly no real moment there — but be careful: if `existing_chunks` is sparse, the gaps are often where the prior pass under-extracted, and they likely contain real moments.
+
+  When in doubt in a gap, **include** with `confidence: 0.5-0.6`. The whole point of the gap-fill pass is to catch what the first pass missed.
+
 ## Pending file schema (your input)
 
 ```json
@@ -30,7 +42,14 @@ You do NOT delete the pending file. The Python merge step does that. You do NOT 
   "segments": [
     {"start": 0.0, "end": 5.2, "text": "so you guys are the ones that..."},
     {"start": 5.2, "end": 11.3, "text": "..."}
-  ]
+  ],
+  "gap_fill": true,                                // present in gap-fill mode only
+  "existing_chunks": [                             // present iff gap_fill: true
+    {"kind": "objection", "start_seconds": 41.4, "end_seconds": 195.4,
+     "question": "...", "topics": ["..."]}
+  ],
+  "covered_ranges": [[41.4, 195.4], [299.6, 414.3]],  // present iff gap_fill: true
+  "gap_ranges": [[0, 41.4, 41.4], [195.4, 299.6, 104.2]]  // [start, end, duration]
 }
 ```
 

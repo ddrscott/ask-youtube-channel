@@ -22,6 +22,7 @@ from .queue import (
     COMPLETED_DIR,
     FAILED_DIR,
     PENDING_DIR,
+    augment_pending_for_gapfill,
     merge_completed,
     prepare_pending,
     queue_counts,
@@ -197,6 +198,25 @@ def queue_prepare(
     console.print(
         f"[green]Wrote:[/green] {written} pending file(s){mode} to {PENDING_DIR}\n"
         f"[yellow]Skipped:[/yellow] {skipped} (transcript fetch failed)"
+    )
+
+
+@queue_app.command("augment-gapfill")
+def queue_augment_gapfill() -> None:
+    """Walk every queue/pending/<id>.json, fetch existing chunks from the API,
+    compute covered + gap ranges, and rewrite the pending file with a
+    ``gap_fill: true`` flag. The chunker treats those files as second-pass
+    extractions: emit only chunks that fall in the gaps. The merge step then
+    POSTs them with replace=False so existing chunks are preserved.
+
+    Run AFTER ``ayc queue prepare --rechunk`` and BEFORE dispatching agents."""
+    cfg = _cfg()
+    with ApiClient(cfg) as client:
+        augmented, skipped = augment_pending_for_gapfill(client)
+    _ = cfg
+    console.print(
+        f"[green]Augmented:[/green] {augmented} pending file(s) with gap-fill metadata.\n"
+        f"[yellow]Skipped:[/yellow] {skipped} (chunk fetch failed or malformed pending)."
     )
 
 

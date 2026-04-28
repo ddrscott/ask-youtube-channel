@@ -204,6 +204,12 @@ class ApiClient:
         r = self._req("GET", f"/internal/videos/{video_id}/transcript")
         return r.json()
 
+    def list_video_chunks(self, video_id: str) -> list[dict[str, Any]]:
+        """Returns the existing chunks for a video, ordered by start_seconds.
+        Used by the gap-fill prepare step."""
+        r = self._req("GET", f"/internal/videos/{video_id}/chunks")
+        return r.json().get("chunks", [])
+
     # ── chunks (relational) ──
 
     def insert_chunks_bulk(
