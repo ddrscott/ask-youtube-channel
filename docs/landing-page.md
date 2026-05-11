@@ -90,7 +90,7 @@ Three steps. Your actual workflow:
 | Type | Copy |
 |---|---|
 | Direct | **Index my channel** |
-| Transitional | **See it run on a live archive** → (links to abolitionist.ask-youtube.app) |
+| Transitional | **See it run on a live archive** → (links to a movement-specific deployment) |
 
 ### 6. Success
 
@@ -116,11 +116,36 @@ Three steps. Your actual workflow:
 
 ### Homepage hero (curiosity → enlightenment → CTA)
 
+Used on the *generic / sales* landing page (editor as hero, "Index my channel" as direct CTA):
+
 > ### Your archive is your biggest content asset — and your slowest.
 >
 > Ask a question. Get the three best clips from your channel that answer it — with deep links, verbatim transcript, and exact timestamps. Cut your next compilation in an afternoon, not a weekend.
 >
 > **[ Index my channel ]**   See it on a live archive →
+
+### Movement-specific landing — pattern
+
+When the page is for a *specific deployment* (your audience already knows the channel exists and just wants the clip), the hook shifts from positioning to recognition. The CTA shifts from "Index my channel" (already done) to "Try a question."
+
+Pattern:
+
+> ### Ever have a hard time finding that one thing he said about [a distinctive, in-group reference]?
+>
+> Or [a second, slightly different example that signals breadth]. Or [a third example pointing at long-form content]: that thing you know was somewhere on a livestream last spring.
+>
+> It's in there. You know which channel. You'd find it if you had three hours.
+>
+> You don't.
+>
+> **Ask the question. Get the clip** — with the timestamp, the verbatim transcript, and a deep link straight to the moment.
+>
+> **[ Try a question ]**
+
+H1 example notes:
+- Pick references that feel **confessional or intellectual**, not confrontational. The page is public — bystanders shouldn't feel ambushed even though they aren't the target.
+- Use **distinctive in-group vocabulary** (book titles, episode shorthand, recurring themes) so the right reader feels "this is for me" within the first six words.
+- Avoid the most polarizing question on the channel as your example, even if it's a real and recurring conversation. Save it for the search box, not the H1.
 
 ### Anti-copy — what *not* to say
 
@@ -134,6 +159,6 @@ Because this is what every competitor says:
 
 ## Open questions for the page
 
-- Do we lead the AR-specific deployment with the editor, or ship a generic homepage that pivots based on `?role=` or referrer?
-- Is "Index my channel" the right primary CTA for the AR deploy specifically, where the channel is already indexed? Probably the AR landing page should have **"Try a question"** as primary and **"Deploy this for your channel"** as secondary.
-- Demo questions to seed on the AR landing page — pick 3–5 that show the clips-first UX at its best (questions where 3+ great clips exist across different videos).
+- Do we lead a movement-specific deployment with the editor, or ship a generic homepage that pivots based on `?role=` or referrer?
+- Is "Index my channel" the right primary CTA for a deployment whose channels are already indexed? Probably the deployment page should have **"Try a question"** as primary and **"Deploy this for your channel"** as secondary.
+- Demo questions to seed on the deployment landing page — pick 3–5 that show the clips-first UX at its best (questions where 3+ great clips exist across different videos).

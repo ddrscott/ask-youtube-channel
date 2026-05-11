@@ -15,7 +15,7 @@ ayc queue <subcommand>        Filesystem queue for Claude Code agent-based chunk
 ## `ayc init`
 
 ```sh
-uv run ayc init "https://www.youtube.com/@AbolitionistsRising"
+uv run ayc init "https://www.youtube.com/@SomeChannel"
 ```
 
 Resolves the channel handle/URL via yt-dlp, upserts a row in `channels`, then enumerates `/videos`, `/streams`, and `/shorts` separately and writes (or upserts) every video row at `ingest_status='pending'` with the `form` set to `long` or `short`.

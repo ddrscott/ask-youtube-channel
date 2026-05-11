@@ -1,0 +1,35 @@
+# Generic placeholder examples for the prompts in ayc/prompts.py.
+#
+# These ship with the repo so the platform stays domain-neutral. To customize
+# for your deployment, copy this file to examples.local.toml and edit. The
+# .local file is gitignored and takes precedence over this default at runtime.
+
+# Inline objection examples used in the chunker prompt. Plain text — appears
+# inside parentheses as "(e.g. <this>)".
+chunker_objection_examples = "\"But X isn't really Y\", \"What about edge case Z?\", \"Source A doesn't address claim B\""
+
+# Inline topic-tag examples used in the chunker prompt. Plain text — appears
+# inside parentheses as "(e.g. <this>)".
+chunker_topic_examples = "[\"core concept\", \"category\"], [\"specific edge case\"], [\"foundational principle\"]"
+
+# A short illustrative QA-style user input for the reformulator prompt.
+reformulator_qa_input_example = "What's the case for the main thesis?"
+
+# Inline objection-style user inputs for the reformulator prompt. Comma-
+# separated quoted phrases.
+reformulator_objection_input_examples = "\"but X isn't really Y\", \"the source doesn't say Z\""
+
+# The full multi-input example block at the end of the reformulator prompt.
+reformulator_full_examples = """
+User input: "but X isn't really Y"
+Reformulations:
+  - {"phrasing": "but X isn't really Y", "kind": "objection"} (verbatim — this is an objection)
+  - {"phrasing": "Is X really Y?", "kind": "qa"} (the inverse question)
+  - {"phrasing": "the nature of X", "kind": "either"} (topic phrasing)
+
+User input: "what about edge case Z"
+Reformulations:
+  - {"phrasing": "What about edge case Z?", "kind": "qa"}
+  - {"phrasing": "This shouldn't apply in case Z", "kind": "objection"}
+  - {"phrasing": "Z exception", "kind": "either"}\
+"""

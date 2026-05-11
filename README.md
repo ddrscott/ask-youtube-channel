@@ -1,14 +1,14 @@
 # ask-youtube-channel (AYC)
 
-A searchable index of every question and every objection raised across abolitionist YouTube channels — paired with the exact moment in the video where it was answered. Live at [ayc.ljs.app](https://ayc.ljs.app).
+A searchable index of every question and every objection raised across one or more YouTube channels — paired with the exact moment in the video where it was answered.
 
-For sidewalk counselors, video editors, researchers, and anyone who's ever lost a conversation to *"I know there's a clip about this somewhere…"*
+For video editors, researchers, content teams, and anyone who's ever lost a conversation to *"I know there's a clip about this somewhere…"*
 
 ## What's in this repo
 
-This is the **operator-side Python pipeline**. It enumerates channels, fetches transcripts, dispatches Claude Code subagents to extract Q&A and objection-rebuttal moments, and POSTs the results to the cloud backend.
+This is the **operator-side Python pipeline**. It enumerates channels, fetches transcripts, dispatches Claude Code subagents to extract Q&A and objection-rebuttal moments, and POSTs the results to a cloud backend.
 
-The cloud backend (Cloudflare Worker, browse UI, admin dashboard, suggest form) lives in a sibling repo at `~/code/ayc.ljs.app/`.
+The cloud backend (Cloudflare Worker, browse UI, admin dashboard, suggest form) lives in a sibling repo. Path is configurable per deployment; this repo's defaults assume `~/code/ayc.ljs.app/`.
 
 ## Quick orientation
 
@@ -43,19 +43,12 @@ The cloud backend (Cloudflare Worker, browse UI, admin dashboard, suggest form) 
 
 The Python pipeline drives ingestion. The Worker owns persistent state and serves all human-facing surfaces.
 
-## Status
+## Per-deployment configuration
 
-Live, indexed across 6 abolitionist channels:
+The chunker prompt embeds short illustrative examples ("the kind of objection your channel actually answers"). Defaults in [`config/examples.toml`](config/examples.toml) are deliberately generic so the platform stays domain-neutral. To customize for your own deployment, copy that file to `config/examples.local.toml` and edit — the `.local` file is gitignored and takes precedence at runtime. See [`config/README.md`](config/README.md) for details.
 
-- @AbolitionistsRising
-- @AbolishHumanAbortion
-- @abolish_abortion_canada
-- @abolishabortionpa9847
-- @abolishabortionnc
-- @abolishabortionky
-
-~2,300 videos enumerated, ~7,000+ chunks (and growing — see [`docs/how-tos.md`](docs/how-tos.md) § *Re-chunk under updated rules*).
+Channels are not configured in this repo. Add them at runtime with `ayc init <channel-url>` (see [`docs/reference/cli.md`](docs/reference/cli.md)).
 
 ## Personal / support
 
-Made by [Scott Pierce](https://askscottpierce.com). Sponsored by Left Join Studio, Inc. Reach out via the personal site for questions or to suggest a channel for indexing.
+Made by [Scott Pierce](https://askscottpierce.com). Sponsored by Left Join Studio, Inc.
