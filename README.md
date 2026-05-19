@@ -49,6 +49,8 @@ The chunker prompt embeds short illustrative examples ("the kind of objection yo
 
 Channels are not configured in this repo. Add them at runtime with `ayc init <channel-url>` (see [`docs/reference/cli.md`](docs/reference/cli.md)).
 
+To run a fully separate index — different D1, different Vectorize, different service token — clone both this repo and the Worker repo into sibling directories and point each clone's `.env` / `wrangler.toml` at its own deployment. See [Stand up a second deployment (separate data)](docs/how-tos.md#stand-up-a-second-deployment-separate-data) for the recipe.
+
 ## Personal / support
 
 Made by [Scott Pierce](https://askscottpierce.com). Sponsored by Left Join Studio, Inc.

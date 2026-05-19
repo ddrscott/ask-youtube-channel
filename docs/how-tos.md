@@ -95,6 +95,103 @@ The deployed Worker shows up at:
 
 Check `https://ayc.ljs.app/healthz` after deploy — should return `{"ok":true,"service":"ayc.ljs.app","environment":"production"}`.
 
+## Stand up a second deployment (separate data)
+
+When you want a different channel to live in its own D1, its own Vectorize index, and its own browse UI — no chunk bleed-through, no shared dashboard, no shared service token. Same Cloudflare account is fine; the resources are namespaced.
+
+Not what you want for *"just add another channel to the existing index"* — for that, `ayc init <new-channel-url>` against the existing deployment is the right answer (see [Add a new channel to the index](#add-a-new-channel-to-the-index)).
+
+**Cost:** one extra Worker (free tier), one extra D1 (free tier covers up to 10), one extra Vectorize index (paid feature — check pricing), one extra R2 bucket (free tier). Two `.env` files and two repo clones on your laptop. **No code changes in either repo** — both are already designed for this; the binding from Python CLI to Worker is entirely env-driven.
+
+### Worker side — ordering matters
+
+The key safety rule: lock the new deployment's *identity* in `wrangler.toml` (Worker `name` + binding names) and scope your shell to the right Cloudflare account **before** running any `wrangler` command. Wrangler reads `wrangler.toml` and the ambient Cloudflare auth — if either still points at the original deployment, `wrangler deploy` could clobber production. IDs from `create` commands get pasted back in after; that's safe because by then the identity is already locked.
+
+1. **Clone the Worker repo.**
+   ```sh
+   cd ~/code
+   git clone <ayc.ljs.app remote> ayc-channel2.ljs.app
+   cd ayc-channel2.ljs.app
+   ```
+
+2. **Scope wrangler to the right account.** Confirm with `wrangler whoami`, then export `CLOUDFLARE_ACCOUNT_ID` (and `CLOUDFLARE_API_TOKEN` if using API-token auth) in a per-clone `.envrc` (direnv) or a sourced script. If `wrangler.toml` hardcodes `account_id = "..."` for the original account, delete that line so the env var wins, or update it to the new account ID.
+
+3. **Edit `wrangler.toml` FIRST — change identity, leave IDs blank:**
+   - `name = "ayc-channel2"` (this is the line that, if wrong, overwrites the original Worker on deploy)
+   - `[[d1_databases]].database_name = "ayc-channel2-db"`, `database_id = "TBD"` (placeholder — filled after step 4)
+   - `[[vectorize]].index_name = "ayc-channel2-chunks"`
+   - `[[r2_buckets]].bucket_name = "ayc-channel2-transcripts"`
+
+   At this point any accidental `wrangler deploy` fails on the placeholder bindings rather than touching production.
+
+4. **Provision Cloudflare resources.** Eyeball each command's output to confirm it created the `ayc-channel2-*` resource, not an `ayc-*` one.
+   ```sh
+   wrangler d1 create ayc-channel2-db
+   # → copy returned database_id into wrangler.toml [[d1_databases]].database_id
+   wrangler d1 execute ayc-channel2-db --remote --file=schema/001_init.sql
+   wrangler d1 execute ayc-channel2-db --remote --file=schema/002_favorites.sql
+   wrangler vectorize create ayc-channel2-chunks --dimensions 1536 --metric cosine
+   wrangler vectorize create-metadata-index ayc-channel2-chunks --property-name kind --type string
+   wrangler vectorize create-metadata-index ayc-channel2-chunks --property-name channel_id --type string
+   wrangler r2 bucket create ayc-channel2-transcripts
+   ```
+
+5. **Set secrets** (full rationale in [`reference/env-and-secrets.md`](reference/env-and-secrets.md)):
+   ```sh
+   wrangler secret put JWT_SECRET            # same value as auth.ljs.app (shared cookie auth)
+   wrangler secret put SERVICE_TOKEN_SALT    # ≥32 random bytes, new for this deployment
+   wrangler secret put DISCORD_WEBHOOK_URL   # optional
+   ```
+
+6. **Deploy** and sanity-check:
+   ```sh
+   npm run deploy
+   curl https://ayc-channel2.<subdomain>.workers.dev/healthz
+   # → {"ok": true, ...}
+   ```
+
+7. **Mint a service token** for the new deployment as in [Mint a service token](#mint-a-service-token), but hit the new Worker URL. Save the `ayc_<hex>` value — you'll paste it into the Python clone's `.env` next.
+
+### Python side — clone, configure, run
+
+1. **Clone this repo to a separate directory.**
+   ```sh
+   cd ~/code
+   git clone <ask-youtube-channel remote> ask-youtube-channel-channel2
+   cd ask-youtube-channel-channel2
+   uv sync
+   ```
+
+2. **Create `.env`** (gitignored) pointing at the new Worker:
+   ```env
+   AYC_API_BASE_URL=https://ayc-channel2.<subdomain>.workers.dev
+   AYC_API_TOKEN=ayc_<minted above>
+   OPENAI_API_KEY=<your existing key — fine to reuse>
+   ```
+
+3. **Customize the chunker prompt** for the new channel's voice (optional but worth it — better examples mean better extraction):
+   ```sh
+   cp config/examples.toml config/examples.local.toml
+   # Edit with phrasings the new channel actually uses. Gitignored, repo-local.
+   ```
+
+4. **Drive ingestion exactly like the first channel.**
+   ```sh
+   uv run ayc init "https://www.youtube.com/@new-channel-handle"
+   uv run ayc status   # confirms you're hitting the new backend — counts are isolated
+   ```
+   Then follow [Add a new channel to the index](#add-a-new-channel-to-the-index) from `/ayc-runbook` onward.
+
+### Verifying isolation
+
+- `ayc status` in the new clone shows only the new channel's counts.
+- `ayc status` in the *original* clone still shows only the original channel's counts.
+- The Cloudflare dashboard's Vectorize page lists two indexes (`ayc-chunks` and `ayc-channel2-chunks`) with independent row counts.
+
+### Why clone, not `uv tool install`
+
+The per-deployment prompt examples (`config/examples.local.toml`) are resolved relative to the package's repo root in `ayc/prompts.py`, and the built wheel only ships the `ayc/` package — not the `config/` directory. Installing as a tool would land the generic defaults with no override path. Cloning sidesteps this entirely; the Python repo doesn't change often, and `git pull` in each clone is cheap.
+
 ## Run a D1 migration
 
 ```sh
