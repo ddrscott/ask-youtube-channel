@@ -34,6 +34,14 @@ config/*
 !config/examples.toml
 !config/README.md
 
+# Eval harness — code is committed, transcript inputs & model outputs are not
+# (they embed channel content and can be regenerated via `eval/battle.py`).
+eval/inputs/
+eval/results/
+
+# Runtime artifacts
+.claude/scheduled_tasks.lock
+
 # Editors / IDEs
 .idea/
 .vscode/

@@ -126,7 +126,7 @@ After all requested phases run:
   - "no captions" video: marked `skipped_no_captions` by the transcript step. Skip it — don't retry unless `--redo-failed` (not yet implemented; mention if relevant).
   - Agent malformed JSON: lands in `queue/failed/<id>.error.txt`. Report at end; don't retry.
   - Merge step finds invalid timestamps: ditto — flagged in `queue/failed/`.
-- **Don't over-eagerly enumerate the catalog** beyond `--limit`. The full long-form set on Abolitionists Rising is ~420 videos; running them all in one go is hours of agent time and tens of thousands of tokens of context. Default `--limit 10` per invocation, let the user iterate.
+- **Don't over-eagerly enumerate the catalog** beyond `--limit`. A typical long-form channel has a few hundred videos; running them all in one go is hours of agent time and tens of thousands of tokens of context. Default `--limit 10` per invocation, let the user iterate.
 
 ## Example invocations
 
