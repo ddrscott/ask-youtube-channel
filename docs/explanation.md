@@ -110,3 +110,11 @@ The current creed reframes the agent around **editor trust**: "if the index miss
 - A coverage-audit Bash step that prints any 90+ second window with no chunk overlap and forces the agent to either fill it or justify the gap
 
 The framing is intentional. Vague "be comprehensive" wording didn't move the LLM. Editor-trust framing (concrete consequence of failure) does.
+
+## Why per-token channel scoping (one catalog, many frontends)
+
+The catalog is one shared, deduped index — a channel is ingested once (the YouTube channel id is the primary key in `channels`, so the pipeline physically can't double-index it). But different audiences should see different subsets. Rather than run a separate D1 + Vectorize per audience — which would re-index any channel two audiences share — every audience is just a frontend holding a `read` token, and the token carries a fixed `channel_scope`. The [`/api/v1/*` read API](reference/api.md) enforces `effective = requested ∩ grant` on every call.
+
+The tradeoff: isolation is **query-time, not physical**. A bug in the scope filter could leak another audience's channels. So the scope is funneled through one helper (`resolveChannelScope` in `src/services/channel-scope.ts`) and enforced in *both* the D1 query and the Vectorize filter — never just one, so a stale vector match can't surface an out-of-scope row. If an audience ever needs a hard security boundary (not just curation by interest), give it its own deployment and eat the duplicate index. For "different audiences by topic," query-time scoping is the right call.
+
+This is the read-side mirror of [why `chunks.channel_id` is denormalized](#why-chunkschannel_id-is-denormalized): the denorm exists precisely so this channel filter is cheap at query time.

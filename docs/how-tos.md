@@ -224,6 +224,32 @@ wrangler d1 execute ayc-ljs-db --remote \
   --command "UPDATE service_tokens SET revoked_at = datetime('now') WHERE label = 'operator-laptop-old'"
 ```
 
+## Create a read token for a frontend
+
+A frontend (a separate site, possibly its own repo) reads the catalog through the [`/api/v1/*` API](reference/api.md) using a `read`-scoped token. Scope the token to the channels that frontend is allowed to surface.
+
+**Easiest — the dashboard:** sign in as `admin`, open `https://ayc.ljs.app/dashboard/tokens`, set a label, keep the `read` scope, choose **Restricted**, pick the channels, and Mint. Copy the plaintext — it is shown once.
+
+**Or via the API:**
+
+```sh
+curl -X POST https://ayc.ljs.app/admin/service-tokens \
+  -H "Cookie: session=<your-session-cookie>" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "abolitionist-site", "scopes": ["read"], "channel_scope": ["UC_aaa", "UC_bbb"]}'
+```
+
+Hand the token to the frontend (env var / config). Because the grant is baked in, the frontend can omit `channels` and get exactly its channels:
+
+```sh
+curl -X POST https://ayc.ljs.app/api/v1/search \
+  -H "Authorization: Bearer ayc_<that-value>" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "incrementalism"}'
+```
+
+Omit `channel_scope` at mint time for an **unrestricted** token — but then every call MUST name `channels` (the API refuses to dump the whole catalog). To revoke, use the dashboard's Revoke button or `POST /admin/service-tokens/:id/revoke`. Full scoping rules: [`reference/api.md`](reference/api.md).
+
 ## Run a manual SQL query against D1
 
 ```sh

@@ -1,12 +1,13 @@
 # API reference
 
-The Cloudflare Worker at `ayc.ljs.app` (also `ayc-ljs-app.ddrscott.workers.dev`) exposes three families of routes. Source: `~/code/ayc.ljs.app/src/routes/`.
+The Cloudflare Worker at `ayc.ljs.app` (also `ayc-ljs-app.ddrscott.workers.dev`) exposes several families of routes — the pipeline API, the channel-scoped read API, the cookie-gated browse API, admin, and HTML pages. Source: `~/code/ayc.ljs.app/src/routes/`.
 
 ## Auth gates
 
 | Family | Auth | Set in |
 |---|---|---|
-| `/internal/*` | `Authorization: Bearer ayc_<token>` | `src/middleware/service.ts` |
+| `/internal/*` | `Authorization: Bearer ayc_<token>` (pipeline tokens) | `src/middleware/service.ts` |
+| `/api/v1/*` | `Authorization: Bearer ayc_<token>` with the `read` scope | `src/middleware/read-token.ts` |
 | `/api/*`, `/browse`, `/suggest` | Magic-link cookie (`session=`) issued by auth.ljs.app | `src/middleware/auth.ts` (`requireAuth`, `requireAuthRedirect`) |
 | `/admin/*`, `/dashboard` | Same cookie + `admin` scope | `src/middleware/auth.ts` (`requireScope`) |
 | `/healthz`, `/`, `/about`, `/privacy`, `/terms` | None | — |
@@ -63,6 +64,31 @@ Cookie-gated. Browser uses these from the browse UI.
 | POST | `/api/submissions` | `{channel_url}` → row in `channel_submissions`. Rate-limited per email. |
 | POST | `/api/suggest` | `{type, channel_url?, message, wants_business}` → Discord webhook + (if type=channel) row in `channel_submissions` |
 
+## `/api/v1/*` — channel-scoped read API
+
+The shared, public read layer that any number of frontends build on. Service-token gated, requiring the `read` scope (`src/middleware/read-token.ts`). Source: `src/routes/api.ts`.
+
+Every request is scoped to a set of channel ids. The **effective** set is `requested ∩ token grant`:
+
+| Token `channel_scope` | Caller omits `channels` | Caller sends `channels` |
+|---|---|---|
+| `null` (unrestricted) | `400 channels_required` — never dumps the catalog | the requested set, verbatim |
+| `["UC_a", …]` (restricted) | defaults to the full grant | the intersection; `403 no_permitted_channels` if empty |
+| `[]` (empty grant) | `403 no_permitted_channels` | `403 no_permitted_channels` |
+
+Scoping is enforced in both the authoritative D1 query (`channel_id IN (…)`) and the Vectorize filter (`channel_id $in […]`), so a token can never reach a channel outside its grant.
+
+| Method | Path | Body / params | Returns |
+|---|---|---|---|
+| GET | `/api/v1/chunks?channels=&kind=&topic=&cursor=&limit=` | `channels` = comma-separated ids; `limit` ≤ 500 (default 200) | `{chunks: [...], next_cursor: string\|null}` — id-ordered, cursor-paginated |
+| GET | `/api/v1/chunks/:id?channels=` | query | `{chunk}`, or `404 chunk_not_found` (also for in-DB but out-of-scope ids) |
+| GET | `/api/v1/chunks/:id/similar?channels=&kind=&top_k=` | `top_k` 1–100 (default 20) | `{source, neighbors: [{...chunk, score}]}` |
+| POST | `/api/v1/search` | `{query, channels?, kind?, top_k?}`; `query` ≤ 500 chars | `{matches: [{...chunk, score}]}` |
+
+`/search` embeds the query text server-side with OpenAI `text-embedding-3-small` (1536d, matching the pipeline's `AYC_EMBED_MODEL`), then runs a scoped Vectorize query. The `:id/similar` endpoint reuses the source chunk's stored vector (no embedding call) and confirms the source is in scope before returning neighbors.
+
+**Error codes:** `401 missing_bearer_token` / `invalid_or_revoked_token`; `403 insufficient_scope` (token lacks `read`); `400 channels_required` / `query_required` / `query_too_long`; `403 no_permitted_channels`; `502 embedding_failed` (OpenAI error on `/search`).
+
 ## `/admin/*` + `/dashboard` — admin
 
 Cookie + `admin` scope.
@@ -70,9 +96,11 @@ Cookie + `admin` scope.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/dashboard` | Server-rendered HTML with KPIs, per-channel table, under-extraction candidates, recent activity, suggestion queue |
+| GET | `/dashboard/tokens` | Token management UI — mint (scope checklist + channel-scope picker), list, and revoke service tokens |
 | GET | `/admin/whoami` | Sanity check — `{email, scopes}` |
-| POST | `/admin/service-tokens` | Mint a new bearer token. Plaintext returned ONCE. |
+| POST | `/admin/service-tokens` | Mint a bearer token. Body `{label, scopes?, channel_scope?}`: `scopes` defaults to `["pipeline:write"]`; `channel_scope` (array of channel ids) locks a `read` token to those channels — omit for unrestricted. Plaintext returned ONCE. |
 | GET | `/admin/service-tokens` | List active tokens (no plaintext) |
+| POST | `/admin/service-tokens/:id/revoke` | Revoke a token — immediate, permanent |
 | GET | `/admin/submissions` | List pending suggestions |
 | POST | `/admin/submissions/:id/accept` | Insert into `channels`, mark accepted |
 
@@ -86,6 +114,7 @@ Cookie + `admin` scope.
 | `/browse/similar/:id` | cookie | Single-chunk view + 20 same-kind neighbors |
 | `/suggest` | cookie | Suggest a channel / feature / bug |
 | `/dashboard` | cookie + admin scope | (see above) |
+| `/dashboard/tokens` | cookie + admin scope | Token management UI |
 | `/login` | none | Redirect to auth.ljs.app/login |
 
 ## Rate limits + quotas

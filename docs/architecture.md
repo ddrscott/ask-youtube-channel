@@ -38,6 +38,7 @@ D1 is the source of truth. Vectorize is derived from D1 (chunks rows → embeddi
 | Surface | How it's gated |
 |---|---|
 | `/internal/*` (pipeline → cloud) | Bearer service token (`Authorization: Bearer ayc_…`). Hashed at rest with `SERVICE_TOKEN_SALT`. |
+| `/api/v1/*` (read API → external frontends) | Bearer service token with the `read` scope, carrying a `channel_scope` grant. The shared read layer multiple audience-specific frontends build on. See [reference/api.md](reference/api.md). |
 | `/api/*` user endpoints (browse, suggest, favorites) | Magic-link cookie issued by [auth.ljs.app](https://auth.ljs.app). Verified locally with shared `JWT_SECRET`. |
 | `/admin/*` + `/dashboard` | Same cookie + `admin` scope in the JWT |
 | `/healthz`, `/`, `/about`, `/privacy`, `/terms` | Public |
