@@ -242,8 +242,10 @@ class ApiClient:
         return r.json().get("chunks", [])
 
     def embeddings_bulk(self, items: list[dict[str, Any]]) -> int:
-        """POST {id, vector} items. Server upserts to Vectorize, sets embedded_at,
-        rolls videos to 'embedded' as their last chunk lands."""
+        """LEGACY (pre-Phase-3.4): POST {id, vector} items. Server upserts to
+        the 1536d OpenAI Vectorize index. Retained for any rollback path;
+        new code should use `reembed_bulk` instead.
+        """
         if not items:
             return 0
         total = 0
@@ -256,6 +258,27 @@ class ApiClient:
             )
             total += r.json().get("upserted", 0)
         return total
+
+    def reembed_bulk(self, chunk_ids: list[str]) -> dict[str, Any]:
+        """POST chunk IDs to the V2 reembed endpoint. The Worker fetches the
+        text, embeds via BGE-M3, upserts to VECTOR_V2, and sets embedded_at.
+        Batch size capped server-side at 100/call.
+        """
+        if not chunk_ids:
+            return {"upserted": 0, "rolled_videos": 0}
+        upserted = 0
+        rolled = 0
+        for i in range(0, len(chunk_ids), 100):
+            batch = chunk_ids[i : i + 100]
+            r = self._req(
+                "POST",
+                "/internal/chunks/reembed:bulk",
+                json_body={"ids": batch},
+            )
+            d = r.json()
+            upserted += d.get("upserted", 0)
+            rolled += d.get("rolled_videos", 0)
+        return {"upserted": upserted, "rolled_videos": rolled}
 
     # ── vector query ──
 
