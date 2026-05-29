@@ -138,6 +138,30 @@ def embed(batch_size: int = typer.Option(100, help="Embedding batch size")) -> N
     console.print(f"[green]Embedded:[/green] {n} chunks")
 
 
+@app.command("backfill-bge")
+def backfill_bge_cmd(
+    video_id: str = typer.Option(None, help="Only re-embed this video's chunks (smoke test)"),
+    batch_size: int = typer.Option(100, help="Chunks per request (max 100, hard limit in Worker)"),
+) -> None:
+    """One-time Phase 3.4 backfill: re-embed every chunk into the V2 Vectorize index via BGE-M3.
+
+    Calls the Worker's `POST /internal/chunks/reembed:bulk` endpoint. The Worker
+    handles text formatting + Workers AI inference + Vectorize upsert; no OpenAI.
+    """
+    from .reembed import backfill_bge as _backfill
+    cfg = _cfg()
+    with ApiClient(cfg) as client:
+        result = _backfill(cfg, client, batch_size=batch_size, only_video_id=video_id)
+    console.print()
+    console.print(
+        f"[green]Backfill complete:[/green] "
+        f"{result['upserted']}/{result['chunks']} chunks upserted to V2 "
+        f"({result['videos']} videos, {result['failed']} failed)"
+    )
+    if result["failed"]:
+        console.print(f"[red]First failed IDs:[/red] {result['failed_ids']}")
+
+
 @app.command()
 def status() -> None:
     """Show ingest progress (queries the cloud)."""
